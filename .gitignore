@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+*.log
+*.local.json
+auth*
+codex-accounts.json
+codex-provider-sync*.json
+sessions/
