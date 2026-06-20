@@ -18,6 +18,7 @@ Currently included:
 - `extensions/safety` — shell/input safety helpers.
 - `extensions/compaction` — opinionated compaction prompt.
 - `extensions/openai-plus` — OpenAI/Codex priority/image helpers.
+- `extensions/model-status` — standalone bottom model/context/usage/TPS status line.
 
 ## Use
 
