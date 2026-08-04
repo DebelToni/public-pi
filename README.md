@@ -3,7 +3,7 @@
 Public, whitelisted Pi extensions from Anton's private Pi config.
 
 Currently included:
-- `extensions/codex-accounts` — multiple Codex/ChatGPT OAuth account providers and `/as` autosub selection.
+- `extensions/codex-accounts` — self-contained Pi 0.83 native Codex/ChatGPT OAuth providers, CRUD, usage-aware `/as`, aliases, and a versioned companion hook for `/as --auto`.
 - `extensions/codex-provider-sync` — sync selected Codex provider/model across Pi sessions.
 - `extensions/exa-search` — Exa web search/answer tools using `EXA_API_KEY`.
 - `extensions/search-session` — search current Pi session transcript.
@@ -35,5 +35,7 @@ Then reload Pi:
 ```text
 /reload
 ```
+
+`codex-accounts` has no sibling-extension or local-script imports. Its small `auto-recovery.ts` file only preserves the quota-signal interface used by the public compaction extension; seat switching, coordination, and continuation recovery are not published here. `/as --auto` reports the private companion as unavailable when it is not installed.
 
 Private runtime files are intentionally not included: `auth.json`, `codex-accounts.json`, `codex-provider-sync*.json`, sessions, logs, local settings.
