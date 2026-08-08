@@ -1,0 +1,10 @@
+{
+  "name": "codex-seat-automation",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "lossless-json": "4.3.1",
+    "proper-lockfile": "4.1.2",
+    "sshpk": "1.18.0"
+  }
+}

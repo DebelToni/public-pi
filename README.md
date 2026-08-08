@@ -1,41 +1,30 @@
 # public-pi
 
-Public, whitelisted Pi extensions from Anton's private Pi config.
+Public, whitelisted Pi extensions from Anton's private Pi configuration.
 
-Currently included:
-- `extensions/codex-accounts` — self-contained Pi 0.83 native Codex/ChatGPT OAuth providers, CRUD, usage-aware `/as`, aliases, and a versioned companion hook for `/as --auto`.
-- `extensions/codex-provider-sync` — sync selected Codex provider/model across Pi sessions.
-- `extensions/exa-search` — Exa web search/answer tools using `EXA_API_KEY`.
-- `extensions/search-session` — search current Pi session transcript.
-- `extensions/ask-past-session` — ask disposable forks of previous sessions.
-- `extensions/subagent` — isolated subagent runner.
-- `extensions/compatible-skills` — compatible skill discovery.
-- `extensions/engineering-principles` — engineering-principles prompt toggle.
-- `extensions/goal` — goal loop/evaluator helper.
-- `extensions/session-recency` — session list recency ordering.
-- `extensions/delete-session` — delete current session/window helper.
-- `extensions/tool-hide` — hide/collapse tool-call UI.
-- `extensions/safety` — shell/input safety helpers.
-- `extensions/compaction` — opinionated compaction prompt.
-- `extensions/openai-plus` — OpenAI/Codex priority/image helpers.
-- `extensions/model-status` — standalone bottom model/context/usage/TPS status line.
+## Automatic Codex account switching
 
-## Use
+The portable no-subagent switching bundle contains:
 
-Copy the wanted extension folder into your Pi agent config:
+- `extensions/codex-accounts` — account providers, usage checks, and account selection.
+- `extensions/codex-provider-sync` — selected provider/model synchronization across Pi sessions.
+- `extensions/codex-seat-automation` — durable signed seat requests and automatic recovery.
+- `extensions/compaction` — custom compaction and quota-failure signaling.
+- `extensions/lib/codex-provider-sync-control.ts`
+- `extensions/lib/internal-usage.ts`
 
-```bash
-mkdir -p ~/.pi/agent/extensions
-cp -R extensions/codex-accounts ~/.pi/agent/extensions/
-cp -R extensions/codex-provider-sync ~/.pi/agent/extensions/
-```
+Follow the complete installation prompt:
 
-Then reload Pi:
+[`prompts/friend-codex-automatic-switching.md`](prompts/friend-codex-automatic-switching.md)
 
-```text
-/reload
-```
+The `subagent` extension is not required. If absent, automatic recovery continues the interrupted main task directly through Pi.
 
-`codex-accounts` has no sibling-extension or local-script imports. Its small `auto-recovery.ts` file only preserves the quota-signal interface used by the public compaction extension; seat switching, coordination, and continuation recovery are not published here. `/as --auto` reports the private companion as unavailable when it is not installed.
+Private provisioning is still required. This repository intentionally excludes sender private keys, webhook URLs, account credentials, OAuth data, local config, runtime state, sessions, and logs.
 
-Private runtime files are intentionally not included: `auth.json`, `codex-accounts.json`, `codex-provider-sync*.json`, sessions, logs, local settings.
+## Other mirrored extensions
+
+The repository also contains selected general-purpose extensions. Copy only the extension folders you want into `~/.pi/agent/extensions`, then use `/reload`.
+
+## Mirror maintenance
+
+`scripts/sync-from-private.sh` copies an explicit file whitelist from the private Pi configuration. It does not copy local config or runtime files.

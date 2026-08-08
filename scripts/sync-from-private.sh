@@ -3,43 +3,43 @@ set -euo pipefail
 
 src="${PI_PRIVATE_CONFIG:-$HOME/.pi/agent}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-destination="$repo/extensions/codex-accounts"
-readonly -a public_files=(
-  "index.ts"
-  "auto-recovery.ts"
-)
 
-for file in "${public_files[@]}"; do
-  test -f "$src/extensions/codex-accounts/$file"
-done
-
-stage="$(mktemp -d "$repo/extensions/.codex-accounts.stage.XXXXXX")"
-backup="$repo/extensions/.codex-accounts.backup.$$"
-cleanup() {
-  rm -rf "$stage"
-  if [ -d "$backup" ] && [ ! -e "$destination" ]; then
-    mv "$backup" "$destination"
-  fi
+copy_files() {
+  local directory="$1"
+  shift
+  rm -rf "$repo/$directory"
+  mkdir -p "$repo/$directory"
+  local file
+  for file in "$@"; do
+    cp -p "$src/$directory/$file" "$repo/$directory/$file"
+  done
 }
-trap cleanup EXIT INT TERM
 
-for file in "${public_files[@]}"; do
-  install -m 0644 "$src/extensions/codex-accounts/$file" "$stage/$file"
-done
+copy_files extensions/codex-accounts \
+  auto-recovery.ts \
+  index.ts
+copy_files extensions/codex-provider-sync \
+  index.ts
+copy_files extensions/codex-seat-automation \
+  README.md \
+  config.example.json \
+  continuation-request.ts \
+  coordinator.py \
+  index.ts \
+  mac-webhook.pub \
+  package-lock.json \
+  package.json \
+  recovery-state.ts \
+  recovery.ts \
+  seat-request.ts \
+  webhook-client.d.ts \
+  webhook-client.mjs
+copy_files extensions/compaction \
+  index.ts \
+  prompt.ts
+copy_files extensions/lib \
+  codex-provider-sync-control.ts \
+  internal-usage.ts
 
-if rg -n '/Users/|/Volumes/|privateKey|server_private|ivancho-codex|cycle_chatgpt_seat' "$stage"; then
-  echo "Refusing to publish a private path or key reference." >&2
-  exit 1
-fi
-if rg -n "from [\"']\\.\\./" "$stage"; then
-  echo "Refusing to publish an extension with a sibling dependency." >&2
-  exit 1
-fi
-
-rm -rf "$backup"
-if [ -d "$destination" ]; then
-  mv "$destination" "$backup"
-fi
-mv "$stage" "$destination"
-rm -rf "$backup"
-trap - EXIT INT TERM
+mkdir -p "$repo/prompts"
+cp -p "$src/prompts/friend-codex-automatic-switching.md" "$repo/prompts/friend-codex-automatic-switching.md"

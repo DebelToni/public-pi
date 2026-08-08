@@ -2,6 +2,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import {
+	CODEX_PROVIDER_SYNC_CONTROL_CHANNEL,
+	type CodexProviderSyncControl,
+} from "../lib/codex-provider-sync-control.js";
 
 const STATE_PATH = join(getAgentDir(), "codex-provider-sync.json");
 const CONFIG_PATH = join(getAgentDir(), "codex-provider-sync.local.json");
@@ -62,6 +66,7 @@ export default function (pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
 	let enabled = readEnabled();
 	let applying = false;
+	let suppressedPublish: { token: string; provider: string; model: string } | undefined;
 	let lastSeenUpdatedAt = readState()?.updatedAt ?? 0;
 	let lastMtimeMs = existsSync(STATE_PATH) ? statSync(STATE_PATH).mtimeMs : 0;
 
@@ -108,6 +113,19 @@ export default function (pi: ExtensionAPI) {
 		} catch {}
 	}
 
+	const unsubscribeSyncControl = pi.events.on(CODEX_PROVIDER_SYNC_CONTROL_CHANNEL, (value) => {
+		if (!value || typeof value !== "object" || !("action" in value) || !("token" in value)) return;
+		const request = value as CodexProviderSyncControl;
+		if (typeof request.token !== "string") return;
+		if (request.action === "cancel") {
+			if (suppressedPublish?.token === request.token) suppressedPublish = undefined;
+			return;
+		}
+		if (typeof request.provider !== "string" || typeof request.model !== "string") return;
+		suppressedPublish = { token: request.token, provider: request.provider, model: request.model };
+		request.accepted = true;
+	});
+
 	const timer = setInterval(() => void pull().catch(() => {}), POLL_MS);
 	if (typeof timer.unref === "function") timer.unref();
 
@@ -124,10 +142,20 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		clearInterval(timer);
+		suppressedPublish = undefined;
+		unsubscribeSyncControl();
 	});
 
 	pi.on("model_select", async (event, eventCtx) => {
 		ctx = eventCtx;
+		if (
+			event.source === "set" &&
+			suppressedPublish?.provider === event.model.provider &&
+			suppressedPublish.model === event.model.id
+		) {
+			suppressedPublish = undefined;
+			return;
+		}
 		if (applying || !enabled || event.source === "restore") return;
 		if (isCodexProvider(event.model.provider)) publish(event.model.provider);
 	});
