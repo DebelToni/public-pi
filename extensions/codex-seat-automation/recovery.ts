@@ -63,12 +63,31 @@ function parseUsageLimitSignal(value: unknown): CodexUsageLimitSignal | undefine
 }
 
 const AUTO_RECOVERY_STATUS_KEY = "codex-auto-recovery";
+const CODEX_QUOTA_EVENT_CHANNEL = "codex-quota-log:event:v1";
 const AUTO_RECOVERY_POLL_MS = 250;
 const AUTO_RECOVERY_WAIT_TIMEOUT_MS = 20 * 60_000;
 
 function recoveryStateText(state?: RecoveryState) {
 	if (!state) return "idle";
 	return `${state.status} (generation ${state.generation})`;
+}
+
+async function recordQuotaEvent(
+	pi: ExtensionAPI,
+	kind: "confirmed-exhaustion" | "provider-selected",
+	provider: string,
+) {
+	const request: { version: 1; kind: typeof kind; provider: string; run?: Promise<void> } = {
+		version: 1,
+		kind,
+		provider,
+	};
+	pi.events.emit(CODEX_QUOTA_EVENT_CHANNEL, request);
+	try {
+		await request.run;
+	} catch {
+		/* Quota history is optional and must never block account recovery. */
+	}
 }
 
 function processIsAlive(pid: number) {
@@ -294,6 +313,9 @@ export function installAutoRecovery(
 				);
 				return;
 			}
+			if (failedUsage.label === "rate limit reached") {
+				await recordQuotaEvent(pi, "confirmed-exhaustion", candidate.provider);
+			}
 			if (!syncUnchanged()) {
 				await fail("provider-changed", "Codex automatic recovery stopped because the global provider changed.");
 				return;
@@ -307,6 +329,7 @@ export function installAutoRecovery(
 				else await fail("account-selection-failed");
 				return;
 			}
+			await recordQuotaEvent(pi, "provider-selected", selection.provider);
 			await finishLeader(generation, "succeeded", selection);
 		} catch (error) {
 			notify(context, `Codex automatic recovery failed: ${error instanceof Error ? error.message : String(error)}`, "error");

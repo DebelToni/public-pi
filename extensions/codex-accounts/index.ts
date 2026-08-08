@@ -23,6 +23,7 @@ const CODEX_PROVIDER_SYNC_CONTROL_CHANNEL = "codex-provider-sync:control";
 
 export const CODEX_SEAT_REQUEST_CHANNEL = "codex-accounts:seat-request:v1";
 export const CODEX_SELECTION_REQUEST_CHANNEL = "codex-accounts:selection-request:v1";
+const CODEX_QUOTA_EVENT_CHANNEL = "codex-quota-log:event:v1";
 
 const DISCOVERED_CODEX_PROVIDER = builtinProviders().find((provider) => provider.id === BASE_PROVIDER);
 const DISCOVERED_CODEX_OAUTH = DISCOVERED_CODEX_PROVIDER?.auth.oauth;
@@ -112,6 +113,21 @@ function modelRuntime(ctx: ExtensionContext) {
 		throw new Error("Pi model runtime credential access is unavailable.");
 	}
 	return runtime;
+}
+
+async function recordSelectedProvider(pi: ExtensionAPI, provider: string) {
+	const request: {
+		version: 1;
+		kind: "provider-selected";
+		provider: string;
+		run?: Promise<void>;
+	} = { version: 1, kind: "provider-selected", provider };
+	pi.events.emit(CODEX_QUOTA_EVENT_CHANNEL, request);
+	try {
+		await request.run;
+	} catch {
+		/* Quota history is optional and must never block account selection. */
+	}
 }
 
 function guardAllows(guard: CodexOperationGuard) {
@@ -594,7 +610,7 @@ async function runAutoSubscription(
 		return selectionFailure("seat-request-failed", seat.message);
 	}
 	if (!guardAllows(guard)) return selectionFailure("cancelled", "Codex account selection was cancelled.");
-	return autoSubscription(
+	const selection = await autoSubscription(
 		pi,
 		ctx,
 		modelId,
@@ -602,6 +618,8 @@ async function runAutoSubscription(
 		guard,
 		{ postSeat: true, suppressProviderSync: false },
 	);
+	if (selection.status === "selected") await recordSelectedProvider(pi, selection.provider);
+	return selection;
 }
 
 function usage() {
