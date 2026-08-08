@@ -24,14 +24,6 @@ cp /tmp/public-pi/extensions/lib/internal-usage.ts ~/.pi/agent/extensions/lib/
 
 If any destination already exists, inspect it and preserve the user’s work instead of overwriting blindly.
 
-The installed seat-automation working directory is:
-
-```text
-~/.pi/agent/extensions/codex-seat-automation
-```
-
-The temporary public source directory is `/tmp/public-pi/extensions/codex-seat-automation` and can be deleted after copying.
-
 Install the seat-request dependencies:
 
 ```bash
@@ -76,6 +68,24 @@ Apply permissions:
 chmod 600 ~/.pi/agent/codex-seat-automation.local.json
 chmod 600 ~/.ssh/FRIEND_PRIVATE_ED25519_KEY
 ```
+
+### Passphrase-protected private keys
+
+The client supports encrypted OpenSSH keys through the `WEBHOOK_KEY_PASSPHRASE` environment variable. Never place the passphrase in the JSON config, this prompt, shell history, or a shared file.
+
+For one supervised Pi launch in macOS zsh, enter it without echoing or saving it:
+
+```bash
+IFS= read -rs "WEBHOOK_KEY_PASSPHRASE?Seat key passphrase: "
+printf '\n'
+export WEBHOOK_KEY_PASSPHRASE
+pi
+unset WEBHOOK_KEY_PASSPHRASE
+```
+
+An already-running Pi cannot inherit a newly exported variable; relaunch it from that shell. The preserved pending operation ID will be reused safely.
+
+For unattended automatic recovery on macOS, store the passphrase in the login Keychain and launch Pi through a local wrapper that reads it at startup. Do not publish that wrapper with machine-specific paths. Alternatively, provision a new dedicated seat-signing key and register its public half on the Mac-side service.
 
 ## 3. Validate without rotating a seat
 

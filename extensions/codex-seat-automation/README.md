@@ -25,3 +25,5 @@ Copy `config.example.json` to `~/.pi/agent/codex-seat-automation.local.json`, re
 Set `automaticRecovery` to `true` if this Pi installation should switch seats automatically after a confirmed Codex quota failure; leave it `false` for manual-only `/as --auto` switching. A pending operation ID is kept under `~/.pi/agent/codex-seat-automation-runtime/` so process or network failure cannot create an accidental second rotation.
 
 Automatic recovery can resume the interrupted main task directly through Pi. The `subagent` extension is optional; it is only needed for subagent continuation features.
+
+Passphrase-protected OpenSSH keys require `WEBHOOK_KEY_PASSPHRASE` in the environment that launches Pi. Never save the passphrase in this config. For unattended macOS recovery, retrieve it from the login Keychain in a local Pi launcher, or provision a dedicated seat-signing key.
