@@ -24,6 +24,14 @@ cp /tmp/public-pi/extensions/lib/internal-usage.ts ~/.pi/agent/extensions/lib/
 
 If any destination already exists, inspect it and preserve the user’s work instead of overwriting blindly.
 
+The installed seat-automation working directory is:
+
+```text
+~/.pi/agent/extensions/codex-seat-automation
+```
+
+The temporary public source directory is `/tmp/public-pi/extensions/codex-seat-automation` and can be deleted after copying.
+
 Install the seat-request dependencies:
 
 ```bash
