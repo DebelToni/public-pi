@@ -20,6 +20,7 @@ const GPT_5_6_CODEX_CONTEXT_WINDOW = 372_000;
 const POST_SEAT_USAGE_ATTEMPTS = 12;
 const POST_SEAT_USAGE_POLL_MS = 5_000;
 const CODEX_PROVIDER_SYNC_CONTROL_CHANNEL = "codex-provider-sync:control";
+export const CODEX_ACCOUNT_SELECTION_MODE_CHANNEL = "codex-accounts:selection-mode:v1";
 
 export const CODEX_SEAT_REQUEST_CHANNEL = "codex-accounts:seat-request:v1";
 export const CODEX_SELECTION_REQUEST_CHANNEL = "codex-accounts:selection-request:v1";
@@ -134,6 +135,12 @@ async function recordSelectedProvider(pi: ExtensionAPI, provider: string) {
 	} catch {
 		/* Quota history is optional and must never block account selection. */
 	}
+}
+
+export function codexAccountSelectionDisabled(pi: Pick<ExtensionAPI, "events">) {
+	const mode = { version: 1, selectionDisabled: false };
+	pi.events.emit(CODEX_ACCOUNT_SELECTION_MODE_CHANNEL, mode);
+	return mode.selectionDisabled;
 }
 
 function guardAllows(guard: CodexOperationGuard) {
@@ -845,6 +852,10 @@ export default function codexAccountsExtension(pi: ExtensionAPI) {
 	const autosubCommand = {
 		description: "Auto-select a logged-in Codex subscription with usage left and sync it across sessions. Usage: /as [--auto] [--refresh [account]] [model]",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			if (codexAccountSelectionDisabled(pi)) {
+				ctx.ui.notify("Codex account selection is disabled while seat test mode is active.", "warning");
+				return;
+			}
 			const parsed = parseAutoSubscriptionArgs(args);
 			const generation = sessionGeneration;
 			const guard = () => sessionActive && generation === sessionGeneration;

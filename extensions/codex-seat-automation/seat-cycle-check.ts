@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	CODEX_ACCOUNT_SELECTION_MODE_CHANNEL,
 	formatCodexAccountUsage,
 	hasUnambiguousPostSeatUsage,
 	queryCodexAccountUsage,
@@ -32,6 +33,16 @@ const DEFAULT_OPERATIONS: SeatCycleCheckOperations = {
 	sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
+export function installCodexSelectionTestMode(pi: ExtensionAPI) {
+	return pi.events.on(CODEX_ACCOUNT_SELECTION_MODE_CHANNEL, (value) => {
+		if (!value || typeof value !== "object") return;
+		const mode = value as { version?: unknown; selectionDisabled?: unknown };
+		if (mode.version === 1 && mode.selectionDisabled === false) {
+			mode.selectionDisabled = true;
+		}
+	});
+}
+
 export function installSeatCycleCheck(
 	pi: ExtensionAPI,
 	overrides: Partial<SeatCycleCheckOperations> = {},
@@ -60,6 +71,13 @@ export function installSeatCycleCheck(
 			const before = await operations.query(context, true);
 			const beforeProvider = soleUsableProvider(before);
 			context.ui.notify(`Before seat rotation:\n${formatCodexAccountUsage(before)}`, "info");
+			if (!beforeProvider) {
+				context.ui.notify(
+					"The initial usage state is not uniquely attributable; no seat was rotated.",
+					"warning",
+				);
+				return;
+			}
 			if (!guard()) return;
 
 			const seat = await operations.rotate(pi, context, guard);
