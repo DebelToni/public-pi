@@ -1,4 +1,4 @@
-#!/Volumes/SSD/v/py/bin/python
+#!/usr/bin/env python3
 """Atomic state coordinator for opt-in Codex account recovery."""
 
 import argparse
