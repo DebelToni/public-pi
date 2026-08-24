@@ -555,7 +555,7 @@ function requireDiagnosticLog(logger: BtwRunLogger, event: string, data: Record<
 	throw new Error(`Cannot write /btw diagnostic log: ${logger.lastError?.message ?? "unknown error"}`);
 }
 
-export default function(pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI) {
 	let agentRunning = false;
 	let latestContextMessages: AgentMessage[] = [];
 	let pendingCapsule: ParentCapsule | undefined;
@@ -954,7 +954,7 @@ export default function(pi: ExtensionAPI) {
 			if (logger.lastError) {
 				try {
 					ctx.ui.notify(`/btw parent diagnostics became incomplete: ${logger.lastError.message}`, "error");
-				} catch { }
+				} catch {}
 			}
 			if (capsule) capsule.runLogger = undefined;
 		}
@@ -1236,7 +1236,7 @@ export default function(pi: ExtensionAPI) {
 				if (logger.lastError) {
 					try {
 						ctx.ui.notify(`/btw diagnostics became incomplete: ${logger.lastError.message}`, "error");
-					} catch { }
+					} catch {}
 				}
 				if (activeLogger === logger) activeLogger = undefined;
 			}
