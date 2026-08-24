@@ -11,7 +11,7 @@ INCLUDE failed approaches with explanations. Number each one. The next instance 
 
 PRESERVE user directives — every correction, preference, and rule. These are sacred and accumulate across compaction cycles. If a directive appeared in a prior summary, carry it forward. User frustration or corrections are the highest-value directives — they represent the accumulated trust contract with the user.
 
-PRESERVE credentials, API keys, auth tokens, endpoint URLs, environment variables, service ports. If the next instance needs it to make a request or run a command, write it down.
+NEVER PRESERVE credentials, API keys, auth tokens, private-key contents, cookies, passphrases, or secret-bearing endpoint/query values. Record only the non-secret location or environment-variable name needed to retrieve them, plus a public fingerprint when relevant. Keep ordinary public endpoint origins and service ports only when operationally necessary.
 
 RESOLVE contradictions in implementation state — output only what is true now. Do not include both sides of a reversal. Settled, conflict-free, positive statements only.
 

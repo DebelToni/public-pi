@@ -1,0 +1,12 @@
+{
+  "name": "pi-modern-latex-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "benchmark": "bun run benchmark.ts"
+  },
+  "dependencies": {
+    "marked": "18.0.5"
+  }
+}

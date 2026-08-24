@@ -1,5 +1,18 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+	ONE_SHOT_MEDIUM_FAST_CHANNEL,
+	OneShotMediumFastState,
+	type OneShotMediumFastRequest,
+} from "../lib/one-shot-medium-fast.js";
+import {
+	FAST_MODE_CHANGED_CHANNEL,
+	FAST_MODE_ENTRY_TYPE,
+	FAST_MODE_USAGE,
+	parseFastCommand,
+	resolveFastMode,
+	type FastSessionState,
+} from "../lib/fast-mode.js";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -10,7 +23,7 @@ import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 const CONFIG_PATH = join(getAgentDir(), "openai-plus.json");
 const SERVICE_TIER = "priority";
 const IMAGE_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
-const DEFAULT_IMAGE_MODEL = "gpt-5.5";
+const DEFAULT_IMAGE_MODEL = "gpt-5.6-sol";
 const DEFAULT_TIMEOUT_MS = 180_000;
 
 type Config = {
@@ -327,25 +340,93 @@ async function generateImage(params: ImageParams, ctx: ExtensionContext, request
 	return { ...parsed, prompt: params.prompt, savedPath, provider, model, action, outputFormat };
 }
 
+function currentFastMode(ctx: ExtensionContext) {
+	return resolveFastMode(ctx.sessionManager.getEntries(), readConfig().fast);
+}
+
 export default function openaiPlus(pi: ExtensionAPI) {
+	const oneShot = new OneShotMediumFastState();
+
+	const unsubscribeOneShot = pi.events.on(ONE_SHOT_MEDIUM_FAST_CHANNEL, (data) => {
+		if (!isRecord(data) || (data.action !== "arm" && data.action !== "cancel")) return;
+		const request = data as OneShotMediumFastRequest;
+		if (request.action === "arm") oneShot.arm();
+		else oneShot.cancel();
+		request.accepted = true;
+	});
+
+	pi.on("session_start", () => oneShot.clear());
+	pi.on("session_shutdown", () => {
+		oneShot.clear();
+		unsubscribeOneShot();
+	});
+	pi.on("agent_settled", () => oneShot.clear());
+
+	pi.on("input", (event) => {
+		oneShot.onInput(event.source, event.streamingBehavior);
+	});
+
+	pi.on("before_agent_start", (event) => {
+		oneShot.onBeforeAgentStart(event.prompt);
+	});
+
+	pi.on("message_start", (event) => {
+		if (event.message.role !== "user") return;
+		const content = event.message.content;
+		const text = typeof content === "string"
+			? content
+			: content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+		oneShot.onUserMessage(text);
+	});
+
 	pi.registerCommand("fast", {
-		description: "Toggle OpenAI service_tier=priority fast mode",
+		description: "Set session or global OpenAI service_tier=priority fast mode",
 		handler: async (args, ctx) => {
-			const arg = args.trim().toLowerCase();
-			const cfg = readConfig();
-			let next: boolean;
-			if (!arg) next = !cfg.fast;
-			else if (["on", "yes", "true", "1"].includes(arg)) next = true;
-			else if (["off", "no", "false", "0"].includes(arg)) next = false;
-			else if (arg === "status") {
-				ctx.ui.notify(`Fast mode: ${cfg.fast ? "on" : "off"}. Current model eligible: ${fastEligible(ctx) ? "yes" : "no"}.`, "info");
-				return;
-			} else {
-				ctx.ui.notify("Usage: /fast [on|off|status]", "error");
+			const command = parseFastCommand(args);
+			if (!command) {
+				ctx.ui.notify(FAST_MODE_USAGE, "error");
 				return;
 			}
-			writeConfig({ fast: next });
-			ctx.ui.notify(`Fast mode ${next ? "on" : "off"}${next && !fastEligible(ctx) ? " (will apply when current model is OpenAI/Codex)" : ""}.`, "info");
+
+			if (command.scope === "global") {
+				const globalDefault = readConfig().fast;
+				if (command.action === "status") {
+					ctx.ui.notify(`Fast global default: ${globalDefault ? "on" : "off"}.`, "info");
+					return;
+				}
+				const next = command.action === "on";
+				if (next !== globalDefault) writeConfig({ fast: next });
+				pi.events.emit(FAST_MODE_CHANGED_CHANNEL, currentFastMode(ctx));
+				ctx.ui.notify(`Fast global default ${next ? "on" : "off"}. Sessions set to inherit now use it.`, "info");
+				return;
+			}
+
+			const current = currentFastMode(ctx);
+			if (command.action === "status") {
+				ctx.ui.notify(
+					`Fast mode — session override: ${current.sessionMode}; global default: ${current.globalDefault ? "on" : "off"}; effective: ${current.effective ? "on" : "off"}; current model eligible: ${fastEligible(ctx) ? "yes" : "no"}.`,
+					"info",
+				);
+				return;
+			}
+
+			if (command.action !== current.sessionMode) {
+				pi.appendEntry<FastSessionState>(FAST_MODE_ENTRY_TYPE, {
+					version: 1,
+					mode: command.action,
+					updatedAt: Date.now(),
+				});
+			}
+			const next = currentFastMode(ctx);
+			pi.events.emit(FAST_MODE_CHANGED_CHANNEL, next);
+			if (command.action === "inherit") {
+				ctx.ui.notify(`Fast mode now inherits the global default (${next.globalDefault ? "on" : "off"}).`, "info");
+			} else {
+				ctx.ui.notify(
+					`Fast mode ${command.action} for this session${command.action === "on" && !fastEligible(ctx) ? " (will apply when the current model is OpenAI/Codex)" : ""}.`,
+					"info",
+				);
+			}
 		},
 	});
 
@@ -399,7 +480,13 @@ export default function openaiPlus(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
-		if (!readConfig().fast || !fastEligible(ctx) || !isRecord(event.payload)) return;
-		return { ...event.payload, service_tier: SERVICE_TIER };
+		let payload = event.payload;
+		let changed = false;
+		if (currentFastMode(ctx).effective && fastEligible(ctx) && isRecord(payload)) {
+			payload = { ...payload, service_tier: SERVICE_TIER };
+			changed = true;
+		}
+		const oneShotPayload = oneShot.rewrite(payload, ctx.model);
+		return oneShotPayload ?? (changed ? payload : undefined);
 	});
 }

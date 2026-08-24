@@ -1,0 +1,11 @@
+{
+  "name": "pi-exa-search-extension",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@types/proper-lockfile": "4.1.4"
+  }
+}

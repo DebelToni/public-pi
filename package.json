@@ -1,0 +1,45 @@
+{
+  "name": "public-pi",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reusable Pi extensions mirrored from Anton Hristov's configuration",
+  "keywords": [],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "lossless-json": "4.3.1",
+    "marked": "18.0.5",
+    "proper-lockfile": "4.1.2",
+    "sshpk": "1.18.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-agent-core": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "pi": {
+    "extensions": [],
+    "prompts": []
+  }
+}

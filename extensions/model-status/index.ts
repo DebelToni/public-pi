@@ -1,20 +1,28 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { FAST_MODE_CHANGED_CHANNEL, resolveFastMode } from "../lib/fast-mode.js";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const OPENAI_PLUS_CONFIG_PATH = join(getAgentDir(), "openai-plus.json");
 const TPS_CONFIG_PATH = join(getAgentDir(), "tps.json");
+const USAGE_STATUS_CONFIG_PATH = join(getAgentDir(), "usage-status.json");
 const SETTINGS_PATH = join(getAgentDir(), "settings.json");
+const MODEL_PREFIX_CHANNEL = "model-status:prefix";
+const PLAN_USAGE_REFRESH_MS = 30 * 60_000;
+const HOUR_MS = 60 * 60_000;
+const DAY_MS = 24 * HOUR_MS;
+const modelPrefixes = new Map<string, { value: string; order: number }>();
 
 const state: {
 	uiRender?: () => void;
-	planUsage?: string;
-	planUsageProvider?: string;
-	planUsageUpdatedAt?: number;
-	planUsageRefreshing?: boolean;
+	activePlanProvider?: string;
+	planUsageEnabled?: boolean;
+	planResetEnabled?: boolean;
+	modelPrefix?: string;
+	promptTabs?: string;
 	thinkingLevel?: string;
 	tpsEnabled?: boolean;
 	tps?: number;
@@ -25,8 +33,35 @@ const state: {
 	tpsTotalStreamMs?: number;
 } = {};
 
-function stripAnsi(input: string) {
-	return input.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "");
+type PlanUsageSnapshot = { usage: string; resetAtMs?: number };
+const planUsageByProvider = new Map<string, PlanUsageSnapshot>();
+const planUsageAttemptedAt = new Map<string, number>();
+const planUsageRefreshing = new Set<string>();
+
+function updateModelPrefix(value: unknown) {
+	if (typeof value === "string") {
+		if (value) modelPrefixes.set("legacy", { value, order: 0 });
+		else modelPrefixes.delete("legacy");
+	} else if (value === undefined) {
+		modelPrefixes.delete("legacy");
+	} else if (value && typeof value === "object") {
+		const contribution = value as { key?: unknown; value?: unknown; order?: unknown };
+		if (typeof contribution.key !== "string" || !contribution.key) return;
+		if (typeof contribution.value === "string" && contribution.value) {
+			modelPrefixes.set(contribution.key, {
+				value: contribution.value,
+				order: typeof contribution.order === "number" ? contribution.order : 0,
+			});
+		} else {
+			modelPrefixes.delete(contribution.key);
+		}
+	} else {
+		return;
+	}
+	state.modelPrefix = [...modelPrefixes.entries()]
+		.sort(([leftKey, left], [rightKey, right]) => left.order - right.order || leftKey.localeCompare(rightKey))
+		.map(([, contribution]) => contribution.value)
+		.join(" ") || undefined;
 }
 
 function fmtTokens(n: number) {
@@ -64,6 +99,25 @@ function leftPercent(window: any) {
 	return Math.max(0, Math.min(100, Math.round(100 - used)));
 }
 
+export function quotaResetAtMs(window: any, observedAtMs: number) {
+	const absolute = typeof window?.reset_at === "number" && Number.isFinite(window.reset_at) ? window.reset_at : undefined;
+	if (absolute !== undefined && absolute > 0) return absolute > 10_000_000_000 ? absolute : absolute * 1000;
+	const remaining = typeof window?.reset_after_seconds === "number" && Number.isFinite(window.reset_after_seconds)
+		? window.reset_after_seconds
+		: undefined;
+	return remaining !== undefined && remaining >= 0 ? observedAtMs + remaining * 1000 : undefined;
+}
+
+export function formatResetRemaining(resetAtMs: number, nowMs = Date.now()) {
+	const remaining = Math.max(0, resetAtMs - nowMs);
+	if (remaining < DAY_MS) return `r:${Math.floor(remaining / HOUR_MS)}h`;
+	return `r:${Math.floor(remaining / DAY_MS)}d`;
+}
+
+function planStatusIsEnabled() {
+	return state.planUsageEnabled !== false || state.planResetEnabled !== false;
+}
+
 function isCodexProvider(provider?: string) {
 	return provider === "openai-codex" || !!provider?.startsWith("codex-");
 }
@@ -74,15 +128,16 @@ function isOpenAIProvider(provider?: string) {
 
 function isFastEnabledFor(ctx: ExtensionContext) {
 	if (!isOpenAIProvider(ctx.model?.provider)) return false;
+	let globalDefault = false;
 	try {
-		if (!existsSync(OPENAI_PLUS_CONFIG_PATH)) return false;
-		return JSON.parse(readFileSync(OPENAI_PLUS_CONFIG_PATH, "utf8"))?.fast === true;
-	} catch {
-		return false;
-	}
+		if (existsSync(OPENAI_PLUS_CONFIG_PATH)) {
+			globalDefault = JSON.parse(readFileSync(OPENAI_PLUS_CONFIG_PATH, "utf8"))?.fast === true;
+		}
+	} catch {}
+	return resolveFastMode(ctx.sessionManager.getEntries(), globalDefault).effective;
 }
 
-function readDefaults() {
+function readDefaults(usageStatusConfigPath: string) {
 	try {
 		if (existsSync(SETTINGS_PATH)) {
 			const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
@@ -94,6 +149,32 @@ function readDefaults() {
 	} catch {
 		state.tpsEnabled = false;
 	}
+	try {
+		const saved = existsSync(usageStatusConfigPath)
+			? JSON.parse(readFileSync(usageStatusConfigPath, "utf8"))
+			: {};
+		const legacy = typeof saved?.enabled === "boolean" ? saved.enabled : true;
+		state.planUsageEnabled = typeof saved?.usage === "boolean" ? saved.usage : legacy;
+		state.planResetEnabled = typeof saved?.reset === "boolean" ? saved.reset : legacy;
+	} catch {
+		state.planUsageEnabled = true;
+		state.planResetEnabled = true;
+	}
+}
+
+function setPlanDisplay(configPath: string, next: { usage?: boolean; reset?: boolean }) {
+	const usage = next.usage ?? (state.planUsageEnabled !== false);
+	const reset = next.reset ?? (state.planResetEnabled !== false);
+	try {
+		mkdirSync(dirname(configPath), { recursive: true });
+		writeFileSync(configPath, `${JSON.stringify({ usage, reset }, null, 2)}\n`, "utf8");
+	} catch {
+		return false;
+	}
+	state.planUsageEnabled = usage;
+	state.planResetEnabled = reset;
+	state.uiRender?.();
+	return true;
 }
 
 function setTpsEnabled(enabled: boolean) {
@@ -113,6 +194,7 @@ function thinkingLetter() {
 	if (level === "medium") return "m";
 	if (level === "high") return "h";
 	if (level === "xhigh") return "x";
+	if (level === "max") return "M";
 	return "n";
 }
 
@@ -130,20 +212,23 @@ function getUsage(ctx: ExtensionContext) {
 	return { input, output, total: live?.tokens ?? total };
 }
 
-async function refreshPlanUsage(ctx: ExtensionContext, force = false) {
+async function refreshPlanUsage(ctx: ExtensionContext) {
+	if (!planStatusIsEnabled()) return;
 	const provider = ctx.model?.provider;
-	if (!isCodexProvider(provider)) {
-		state.planUsage = undefined;
-		state.planUsageProvider = undefined;
-		return;
-	}
+	if (!isCodexProvider(provider)) return;
 	const now = Date.now();
-	if (!force && state.planUsageProvider === provider && state.planUsageUpdatedAt && now - state.planUsageUpdatedAt < 60_000) return;
-	if (state.planUsageRefreshing) return;
-	state.planUsageRefreshing = true;
+	const attemptedAt = planUsageAttemptedAt.get(provider!);
+	if (attemptedAt !== undefined && now - attemptedAt < PLAN_USAGE_REFRESH_MS) return;
+	if (planUsageRefreshing.has(provider!)) return;
+	planUsageAttemptedAt.set(provider!, now);
+	planUsageRefreshing.add(provider!);
 	try {
 		const token = await ctx.modelRegistry.getApiKeyForProvider(provider!);
 		const accountId = token ? accountIdFromJwt(token) : undefined;
+		if (!planStatusIsEnabled()) {
+			planUsageAttemptedAt.delete(provider!);
+			return;
+		}
 		if (!token || !accountId) return;
 		const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
 			headers: {
@@ -155,17 +240,20 @@ async function refreshPlanUsage(ctx: ExtensionContext, force = false) {
 		});
 		if (!response.ok) return;
 		const bucket = asRecord((await response.json())?.rate_limit);
-		const five = leftPercent(bucket?.primary_window);
-		if (five !== undefined) {
-			state.planUsage = `u:${five}%`;
-			state.planUsageProvider = provider;
-			state.planUsageUpdatedAt = now;
-			state.uiRender?.();
+		const window = asRecord(bucket?.primary_window);
+		const remaining = leftPercent(window);
+		if (remaining !== undefined) {
+			const receivedAt = Date.now();
+			planUsageByProvider.set(provider!, {
+				usage: `u:${remaining}%`,
+				resetAtMs: quotaResetAtMs(window, receivedAt),
+			});
+			if (state.activePlanProvider === provider) state.uiRender?.();
 		}
 	} catch {
 		// Keep previous cached value.
 	} finally {
-		state.planUsageRefreshing = false;
+		planUsageRefreshing.delete(provider!);
 	}
 }
 
@@ -174,11 +262,25 @@ function statusText(ctx: ExtensionContext, width: number) {
 	const model = ctx.model ? ctx.model.id : "no-model";
 	const fast = isFastEnabledFor(ctx) ? "f" : "";
 	const think = thinkingLetter();
-	const plan = state.planUsage && (!state.planUsageProvider || state.planUsageProvider === ctx.model?.provider) ? ` ${state.planUsage}` : "";
+	const planSnapshot = !ctx.model?.provider ? undefined : planUsageByProvider.get(ctx.model.provider);
+	const planParts: string[] = [];
+	if (state.planUsageEnabled !== false && planSnapshot) planParts.push(planSnapshot.usage);
+	if (state.planResetEnabled !== false && planSnapshot?.resetAtMs !== undefined) {
+		planParts.push(formatResetRemaining(planSnapshot.resetAtMs));
+	}
+	const plan = planParts.length ? ` ${planParts.join(" ")}` : "";
 	const tps = state.tpsEnabled && state.tps ? ` t:${state.tps}` : "";
-	const raw = `${model}${fast}${think} c:${fmtTokens(usage.total)}${plan}${tps}`;
-	const line = truncateToWidth(raw, width, "...");
-	return `${" ".repeat(Math.max(0, width - stripAnsi(line).length))}${line}`;
+	const prefix = state.modelPrefix ? `${state.modelPrefix} ` : "";
+	const raw = `${prefix}${model}${fast}${think} c:${fmtTokens(usage.total)}${plan}${tps}`;
+	const right = truncateToWidth(raw, width, "...");
+	const rightWidth = visibleWidth(right);
+	const maxLeftWidth = width - rightWidth - 1;
+	if (!state.promptTabs || maxLeftWidth < 8) {
+		return `${" ".repeat(Math.max(0, width - rightWidth))}${right}`;
+	}
+	const left = truncateToWidth(state.promptTabs, maxLeftWidth, "…");
+	const gap = " ".repeat(Math.max(1, width - visibleWidth(left) - rightWidth));
+	return `${ctx.ui.theme.fg("dim", left)}${gap}${right}`;
 }
 
 function tpsAgentStart() {
@@ -238,20 +340,93 @@ function tpsAgentEnd() {
 	}
 }
 
-export default function (pi: ExtensionAPI) {
-	pi.on("session_start", async (_event, ctx) => {
-		readDefaults();
-		void refreshPlanUsage(ctx, true);
+export default function (pi: ExtensionAPI, options: { usageStatusConfigPath?: string } = {}) {
+	const usageStatusConfigPath = options.usageStatusConfigPath ?? USAGE_STATUS_CONFIG_PATH;
+	let resetCountdownTimer: NodeJS.Timeout | undefined;
+	let unsubscribeModelPrefix: (() => void) | undefined;
+	let unsubscribeFastMode: (() => void) | undefined;
+	let unsubscribePromptTabs: (() => void) | undefined;
+
+	pi.on("session_start", (_event, ctx) => {
+		readDefaults(usageStatusConfigPath);
+		modelPrefixes.clear();
+		state.modelPrefix = undefined;
+		state.promptTabs = undefined;
+		unsubscribeModelPrefix?.();
+		unsubscribeModelPrefix = pi.events.on(MODEL_PREFIX_CHANNEL, (value) => {
+			updateModelPrefix(value);
+			state.uiRender?.();
+		});
+		unsubscribeFastMode?.();
+		unsubscribeFastMode = pi.events.on(FAST_MODE_CHANGED_CHANNEL, () => state.uiRender?.());
+		unsubscribePromptTabs?.();
+		unsubscribePromptTabs = pi.events.on("prompt-tabs:footer", (value) => {
+			state.promptTabs = typeof value === "string" && value ? value : undefined;
+		});
+		state.activePlanProvider = isCodexProvider(ctx.model?.provider) ? ctx.model?.provider : undefined;
+		void refreshPlanUsage(ctx);
 		if (!ctx.hasUI) return;
 		ctx.ui.setFooter((tui) => {
 			state.uiRender = () => tui.requestRender();
 			return { invalidate() {}, render(width: number): string[] { return [statusText(ctx, width)]; } };
 		});
+		if (resetCountdownTimer) clearInterval(resetCountdownTimer);
+		resetCountdownTimer = setInterval(() => {
+			if (state.planResetEnabled !== false) state.uiRender?.();
+		}, 60_000);
+		resetCountdownTimer.unref();
 	});
 
-	pi.on("model_select", async (_event, ctx) => { void refreshPlanUsage(ctx, true); });
-	pi.on("turn_end", async (_event, ctx) => { void refreshPlanUsage(ctx); });
+	pi.on("session_shutdown", () => {
+		if (resetCountdownTimer) clearInterval(resetCountdownTimer);
+		resetCountdownTimer = undefined;
+		unsubscribeModelPrefix?.();
+		unsubscribeModelPrefix = undefined;
+		unsubscribeFastMode?.();
+		unsubscribeFastMode = undefined;
+		unsubscribePromptTabs?.();
+		unsubscribePromptTabs = undefined;
+		modelPrefixes.clear();
+		state.modelPrefix = undefined;
+		state.promptTabs = undefined;
+		state.activePlanProvider = undefined;
+		state.uiRender = undefined;
+	});
+
+	pi.on("model_select", (_event, ctx) => {
+		state.activePlanProvider = isCodexProvider(ctx.model?.provider) ? ctx.model?.provider : undefined;
+		void refreshPlanUsage(ctx);
+	});
+	pi.on("turn_end", (_event, ctx) => { void refreshPlanUsage(ctx); });
 	pi.on("thinking_level_select", async (event) => { state.thinkingLevel = event.level; state.uiRender?.(); });
+
+	const registerPlanToggle = (name: "usage" | "reset", label: string) => {
+		pi.registerCommand(name, {
+			description: `Toggle Codex ${label.toLowerCase()} display in the model status line`,
+			handler: async (args, ctx) => {
+				const arg = args.trim().toLowerCase();
+				const enabled = name === "usage" ? state.planUsageEnabled !== false : state.planResetEnabled !== false;
+				if (arg === "status") {
+					ctx.ui.notify(`${label} display: ${enabled ? "on" : "off"}`, "info");
+					return;
+				}
+				if (arg && arg !== "on" && arg !== "off") {
+					ctx.ui.notify(`Usage: /${name} [on|off|status]`, "warning");
+					return;
+				}
+				const next = arg === "on" ? true : arg === "off" ? false : !enabled;
+				const update = name === "usage" ? { usage: next } : { reset: next };
+				if (!setPlanDisplay(usageStatusConfigPath, update)) {
+					ctx.ui.notify(`Could not save the ${label.toLowerCase()} display setting.`, "error");
+					return;
+				}
+				if (next) void refreshPlanUsage(ctx);
+				ctx.ui.notify(`${label} display ${next ? "on" : "off"}`, "info");
+			},
+		});
+	};
+	registerPlanToggle("usage", "Usage");
+	registerPlanToggle("reset", "Reset");
 
 	pi.registerCommand("tps", {
 		description: "Toggle TPS display in the model status line",

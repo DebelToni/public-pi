@@ -173,6 +173,7 @@ export function installAutoRecovery(
 	let polling = false;
 	let shuttingDown = false;
 	let sessionEpoch = 0;
+	let quotaFalsePositiveRetryUsed = false;
 	const handledGenerations = new Set<number>();
 	const continuationRuns = new Map<number, Promise<void>>();
 	const coordinatorErrorGenerations = new Set<number>();
@@ -313,6 +314,7 @@ export function installAutoRecovery(
 				);
 				return;
 			}
+			notify(context, "Confirmed ChatGPT subscription exhaustion; selecting a replacement account…", "warning");
 			if (failedUsage.label === "rate limit reached") {
 				await recordQuotaEvent(pi, "confirmed-exhaustion", candidate.provider);
 			}
@@ -395,10 +397,29 @@ export function installAutoRecovery(
 			if (state.status === "failed" || !state.selectedProvider || !state.selectedModel || !state.selectedSyncId) {
 				pending = undefined;
 				setRecoveryStatus(localPending.context);
-				if (!handledGenerations.has(state.generation)) {
-					handledGenerations.add(state.generation);
-					notify(localPending.context, "Codex automatic account recovery failed; this session remains stopped for manual intervention.", "warning");
+				if (handledGenerations.has(state.generation)) return;
+				handledGenerations.add(state.generation);
+				if (state.failureCode === "quota-not-exhausted") {
+					if (!quotaFalsePositiveRetryUsed && isCurrentSession(localPending) && localPending.context.isIdle()) {
+						quotaFalsePositiveRetryUsed = true;
+						notify(localPending.context, "The usage-limit response was not confirmed by live quota; retrying once on the same account…", "info");
+						try {
+							const run = requestContinuation(pi, localPending.context, { target: "main" }).catch((error) => {
+								notify(localPending.context, `The same-account retry failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+							});
+							continuationRuns.set(state.generation, run);
+							void run.finally(() => {
+								if (continuationRuns.get(state.generation) === run) continuationRuns.delete(state.generation);
+							});
+						} catch (error) {
+							notify(localPending.context, `The same-account retry failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+						}
+					} else {
+						notify(localPending.context, "The usage-limit response was not confirmed by live quota; the account was left unchanged. Retry the prompt manually if needed.", "warning");
+					}
+					return;
 				}
+				notify(localPending.context, "Codex automatic account recovery failed; this session remains stopped for manual intervention.", "warning");
 				return;
 			}
 			if (operations.readSyncId(state.selectedProvider, state.selectedModel) !== state.selectedSyncId) {
@@ -469,10 +490,10 @@ export function installAutoRecovery(
 			pending = localPending;
 			setRecoveryStatus(context, "waiting for global Codex account recovery…");
 			if (joined.action === "leader") {
-				notify(context, "Confirmed ChatGPT subscription exhaustion; starting one global account recovery.", "warning");
+				notify(context, "Codex reported a subscription usage-limit error; verifying live quota before recovery…", "warning");
 				void runLeader(candidate, localPending).finally(() => void pollPending());
 			} else if (state.status === "switching") {
-				notify(context, "ChatGPT subscription exhaustion joined the global account recovery; waiting…", "warning");
+				notify(context, "Joined global Codex quota verification; waiting…", "warning");
 			}
 			void pollPending();
 			if (waitForCompletion) {
@@ -550,6 +571,7 @@ export function installAutoRecovery(
 
 	pi.on("session_start", (_event, context) => {
 		sessionEpoch++;
+		quotaFalsePositiveRetryUsed = false;
 		shuttingDown = false;
 		activeContext = context;
 		enabled = operations.readEnabled();
@@ -579,6 +601,7 @@ export function installAutoRecovery(
 			return;
 		}
 		if (!candidate) {
+			if (event.message.stopReason !== "error") quotaFalsePositiveRetryUsed = false;
 			if (!detectedCandidate?.holdUntilSettled) detectedCandidate = undefined;
 			return;
 		}

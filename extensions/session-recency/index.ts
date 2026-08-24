@@ -10,10 +10,11 @@ function canonicalPath(path: string | undefined) {
 	}
 }
 
-function bubbleParentModifiedByNewestDescendant<T extends { path: string; parentSessionPath?: string; modified: Date }>(sessions: T[]) {
+function bubbleParentModifiedByNewestDescendant<T extends { path: string; parentSessionPath?: string; modified: Date; __piOwnModified?: Date }>(sessions: T[]) {
 	const byPath = new Map<string, T>();
 	const children = new Map<string, T[]>();
 	for (const session of sessions) {
+		session.__piOwnModified ??= new Date(session.modified);
 		byPath.set(canonicalPath(session.path) ?? session.path, session);
 	}
 	for (const session of sessions) {

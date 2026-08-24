@@ -1,0 +1,12 @@
+{
+  "defaultActive": false,
+  "activateAfterCompactions": 1,
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "thinkingLevel": "medium",
+  "maxDeltaChars": 60000,
+  "maxKbChars": 80000,
+  "maxOutputTokens": 6000,
+  "snapshotEveryPatches": 10,
+  "maxObservedEvents": 80
+}

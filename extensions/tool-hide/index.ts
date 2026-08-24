@@ -1,10 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realpathSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PATCH_KEY = Symbol.for("anton.pi.tool-hide.state");
+const ASSISTANT_PATCH_KEY = Symbol.for("anton.pi.tool-hide.assistant-render");
 
 type ToolHideState = {
 	hidden: boolean;
@@ -20,10 +20,27 @@ type ToolExecutionModule = {
 	};
 };
 
+type AssistantMessage = {
+	stopReason?: string;
+	content?: Array<{ type?: string; text?: string }>;
+};
+
+type AssistantMessageComponent = {
+	lastMessage?: AssistantMessage;
+};
+
+type AssistantMessageModule = {
+	AssistantMessageComponent: {
+		prototype: {
+			render: (width: number) => string[];
+			[ASSISTANT_PATCH_KEY]?: true;
+		};
+	};
+};
+
 function resolvePiDistEntry() {
-	const require = createRequire(import.meta.url);
 	try {
-		return require.resolve("@earendil-works/pi-coding-agent");
+		return fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
 	} catch {}
 
 	try {
@@ -31,13 +48,18 @@ function resolvePiDistEntry() {
 		if (cliPath.endsWith("/dist/cli.js")) return join(dirname(cliPath), "index.js");
 	} catch {}
 
-	return "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
+	throw new Error("Could not locate the installed Pi coding-agent package.");
 }
 
-async function patchToolExecutionRenderer(): Promise<ToolHideState> {
+async function patchRenderers(): Promise<ToolHideState> {
 	const packageEntry = resolvePiDistEntry();
-	const toolExecutionPath = join(dirname(packageEntry), "modes/interactive/components/tool-execution.js");
-	const { ToolExecutionComponent } = (await import(pathToFileURL(toolExecutionPath).href)) as ToolExecutionModule;
+	const componentsDir = join(dirname(packageEntry), "modes/interactive/components");
+	const toolExecutionPath = join(componentsDir, "tool-execution.js");
+	const assistantMessagePath = join(componentsDir, "assistant-message.js");
+	const [{ ToolExecutionComponent }, { AssistantMessageComponent }] = await Promise.all([
+		import(pathToFileURL(toolExecutionPath).href) as Promise<ToolExecutionModule>,
+		import(pathToFileURL(assistantMessagePath).href) as Promise<AssistantMessageModule>,
+	]);
 	const proto = ToolExecutionComponent.prototype;
 
 	let state = proto[PATCH_KEY];
@@ -51,6 +73,20 @@ async function patchToolExecutionRenderer(): Promise<ToolHideState> {
 			if (state!.hidden) return [];
 			return state!.originalRender.call(this, width);
 		};
+	}
+
+	const assistantProto = AssistantMessageComponent.prototype;
+	if (!assistantProto[ASSISTANT_PATCH_KEY]) {
+		const originalRender = assistantProto.render;
+		assistantProto.render = function (this: AssistantMessageComponent, width: number) {
+			const lines = originalRender.call(this, width);
+			const message = this.lastMessage;
+			const isFinalAnswer = message?.stopReason === "stop"
+				&& message.content?.some((part) => part.type === "text" && part.text?.trim());
+			if (!state!.hidden || !isFinalAnswer || lines.length === 0) return lines;
+			return ["-".repeat(Math.min(3, Math.max(0, width))), ...lines];
+		};
+		assistantProto[ASSISTANT_PATCH_KEY] = true;
 	}
 
 	return state;
@@ -71,7 +107,7 @@ function toggleToolVisibility(ctx: ExtensionContext, state: ToolHideState) {
 }
 
 export default async function (pi: ExtensionAPI) {
-	const state = await patchToolExecutionRenderer();
+	const state = await patchRenderers();
 
 	pi.on("session_start", async (_event, ctx) => {
 		applyUiState(ctx, state.hidden);

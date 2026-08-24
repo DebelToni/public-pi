@@ -1,12 +1,13 @@
-import { complete } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { textOfMessage } from "../modes/shared.js";
 import { recordInternalUsage } from "../lib/internal-usage.js";
 
 const STATE_TYPE = "pi-goal-state";
 const GOAL_PROVIDER = "openai-codex";
-const GOAL_MODEL = "gpt-5.4-mini";
+const GOAL_MODEL = "gpt-5.6-sol";
+const GOAL_REASONING = "high";
 
 type GoalState = {
 	active: boolean;
@@ -88,7 +89,7 @@ async function evaluateGoal(pi: ExtensionAPI, ctx: ExtensionContext) {
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok || !auth.apiKey) throw new Error(`No auth for goal evaluator model: ${GOAL_PROVIDER}/${GOAL_MODEL}`);
 	const prompt = `You are a strict goal-completion judge for a coding agent loop.\n\nGoal:\n${state.goal}\n\nRead only the transcript segment below, from the last user message through the final assistant response. Decide whether the goal is now fully complete.\n\nReturn only JSON with this shape:\n{"complete": boolean, "reason": "short explanation"}\n\nTranscript segment:\n${formatSegment(segment.messages)}`;
-	const response = await complete(model, { messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: 1200 });
+	const response = await complete(model, { messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: 1200, reasoning: GOAL_REASONING });
 	recordInternalUsage(pi, "goal", model, response);
 	const text = response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map((c) => c.text).join("\n");
 	return { ...parseDecision(text), assistantEntryId: segment.assistantEntryId };
@@ -115,7 +116,9 @@ export default function (pi: ExtensionAPI) {
 			state.lastAssistantEntryId = undefined;
 			persist(pi);
 			ctx.ui.notify(`Goal armed: ${goal}`, "info");
-			pi.sendUserMessage(`Work toward this goal until it is fully complete:\n\n${goal}`);
+			const kickoff = `Work toward this goal until it is fully complete:\n\n${goal}`;
+			if (ctx.isIdle()) pi.sendUserMessage(kickoff);
+			else pi.sendUserMessage(kickoff, { deliverAs: "followUp" });
 		},
 	});
 

@@ -10,7 +10,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { textOfMessage } from "../modes/shared.js";
 
-const DEFAULT_MODEL_ID = "gpt-5.4-mini";
+const DEFAULT_MODEL_ID = "gpt-5.6-sol";
 const CODEX_ACCOUNTS_EXTENSION = join(getAgentDir(), "extensions", "codex-accounts", "index.ts");
 const MAX_SCAN_SESSIONS = 400;
 const MAX_PROMPT_QUERY_CHARS = 4000;
@@ -299,7 +299,7 @@ const Params = Type.Object({
 	sinceHours: Type.Optional(Type.Number({ description: "Only consider sessions modified within the last N hours." })),
 	sessionHint: Type.Optional(Type.String({ description: "Optional extra text to help find the right session." })),
 	session: Type.Optional(Type.String({ description: "Exact session file path to ask. Skips search." })),
-	model: Type.Optional(Type.String({ description: "Model for the disposable fork. Defaults to current-codex-provider/gpt-5.4-mini." })),
+	model: Type.Optional(Type.String({ description: "Model for the disposable fork. Defaults to current-codex-provider/gpt-5.6-sol." })),
 	thinking: Type.Optional(Type.String({ description: "Thinking level for the disposable fork. Default: low." })),
 	limit: Type.Optional(Type.Number({ description: "Number of candidate sessions to inspect during search. Default: 5." })),
 	dryRun: Type.Optional(Type.Boolean({ description: "Only show candidate sessions; do not fork or ask." })),

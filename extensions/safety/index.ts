@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isBashToolResult, isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { headTail } from "../modes/shared.js";
+import { shouldBlockDangerousRmRf } from "./rm-rf-policy.js";
 
 export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event) => {
@@ -13,10 +14,10 @@ export default function (pi: ExtensionAPI) {
 		return { action: "continue" };
 	});
 
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (isToolCallEventType("bash", event)) {
 			const command = event.input.command ?? "";
-			if (/\brm\s+-rf\s+(\*|\/|~|\.\.?\/?\s*$)/.test(command)) {
+			if (shouldBlockDangerousRmRf(command, ctx.cwd)) {
 				return { block: true, reason: "Blocked dangerous rm -rf pattern by safety extension." };
 			}
 		}

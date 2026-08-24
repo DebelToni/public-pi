@@ -18,6 +18,8 @@ type CustomSettings = {
 	compactionThinkingLevel?: ThinkingLevel;
 };
 
+export const FAST_COMPACTION_MODEL = "gpt-5.6-luna";
+
 function readJson(path: string): any {
 	try {
 		if (!existsSync(path)) return undefined;
@@ -54,8 +56,14 @@ export function resolveCompactionModelConfig(
 	return { provider, model, reasoning: settings.compactionThinkingLevel ?? "high" };
 }
 
-function getCompactionModelConfig(ctx: ExtensionContext) {
-	return resolveCompactionModelConfig(getCustomSettings(ctx.cwd), ctx.model);
+function getCompactionModelConfig(ctx: ExtensionContext, useFastModel: boolean) {
+	const settings = getCustomSettings(ctx.cwd);
+	if (!useFastModel) return resolveCompactionModelConfig(settings, ctx.model);
+	return {
+		provider: ctx.model?.provider ?? "openai-codex",
+		model: FAST_COMPACTION_MODEL,
+		reasoning: settings.compactionThinkingLevel ?? "high",
+	};
 }
 
 export function reportCompactionUsageLimit(
@@ -81,7 +89,8 @@ function setCompactionProgress(ctx: ExtensionContext, modelName: string, text: s
 export default function (pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
 		const { preparation, signal, customInstructions } = event;
-		const compactModel = getCompactionModelConfig(ctx);
+		const useFastModel = event.reason === "manual" && customInstructions?.trim() === "fast";
+		const compactModel = getCompactionModelConfig(ctx, useFastModel);
 		const model = ctx.modelRegistry.find(compactModel.provider, compactModel.model);
 		if (!model) {
 			ctx.ui.notify(`Compaction cancelled: ${compactModel.provider}/${compactModel.model} is unavailable.`, "error");
@@ -93,7 +102,11 @@ export default function (pi: ExtensionAPI) {
 			return { cancel: true };
 		}
 		const conversationText = serializeConversation(convertToLlm([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages]));
-		const prompt = buildCompactionPrompt(conversationText, preparation.previousSummary, customInstructions);
+		const prompt = buildCompactionPrompt(
+			conversationText,
+			preparation.previousSummary,
+			useFastModel ? undefined : customInstructions,
+		);
 		try {
 			const modelName = `${model.provider}/${model.id} @ ${compactModel.reasoning}`;
 			let text = "";
