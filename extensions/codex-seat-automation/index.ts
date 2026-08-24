@@ -4,12 +4,14 @@ import {
 	readSeatAutomationConfig,
 	seatRequestTransportV1,
 } from "./seat-request.js";
+import { installSeatCycleCheck } from "./seat-cycle-check.js";
 
 export { installSeatRequestHook, readSeatAutomationConfig, seatRequestTransportV1 } from "./seat-request.js";
 export type { CodexSeatRequestTransportV1, SeatAutomationConfigV1 } from "./seat-request.js";
 
 export default async function codexSeatAutomationExtension(pi: ExtensionAPI) {
 	installSeatRequestHook(pi);
+	installSeatCycleCheck(pi);
 	let automaticRecovery = false;
 	let configurationError: string | undefined;
 	try {

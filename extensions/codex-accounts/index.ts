@@ -96,6 +96,12 @@ export type CodexSelectionRequestV1 = {
 };
 
 export type CodexUsageStatus = { score: number; label: string };
+export type CodexAccountUsageEntry = {
+	label: string;
+	providerId: string;
+	usage?: CodexUsageStatus;
+	error?: string;
+};
 
 type AutoSubscriptionOptions = { forceRefresh?: boolean; accountLabel?: string };
 type UsageCheck =
@@ -436,6 +442,27 @@ async function checkUsage(ctx: ExtensionContext, accounts: StoredAccount[], forc
 			return { account, error: error instanceof Error ? error.message : String(error) };
 		}
 	}));
+}
+
+export async function queryCodexAccountUsage(
+	ctx: ExtensionContext,
+	forceRefresh = false,
+): Promise<CodexAccountUsageEntry[]> {
+	const configured = new Set((await modelRuntime(ctx).credentials.list()).map((item) => item.providerId));
+	const accounts = loadAccounts().filter((account) => configured.has(account.providerId));
+	const results = await checkUsage(ctx, accounts, forceRefresh);
+	return results.map((result) => ({
+		label: result.account.label,
+		providerId: result.account.providerId,
+		...(hasUsage(result) ? { usage: result.usage } : { error: result.error }),
+	}));
+}
+
+export function formatCodexAccountUsage(entries: readonly CodexAccountUsageEntry[]) {
+	if (!entries.length) return "No logged-in Codex accounts found.";
+	return entries.map((entry) =>
+		`${entry.label}: ${entry.usage?.label ?? entry.error ?? "unknown"}`
+	).join("\n");
 }
 
 async function wait(milliseconds: number) {
@@ -797,6 +824,22 @@ export default function codexAccountsExtension(pi: ExtensionAPI) {
 	pi.registerCommand("codex-accounts", {
 		description: "Manage multiple ChatGPT/Codex OAuth accounts",
 		handler: async (args, ctx) => handleCommand(pi, args, ctx),
+	});
+	pi.registerCommand("codex-usage", {
+		description: "Print live usage for every logged-in Codex account without selecting one",
+		handler: async (args, ctx) => {
+			const normalized = args.trim();
+			if (normalized && normalized !== "--refresh") {
+				ctx.ui.notify("Usage: /codex-usage [--refresh]", "warning");
+				return;
+			}
+			ctx.ui.notify(
+				formatCodexAccountUsage(
+					await queryCodexAccountUsage(ctx, normalized === "--refresh"),
+				),
+				"info",
+			);
+		},
 	});
 
 	const autosubCommand = {

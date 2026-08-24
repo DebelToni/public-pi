@@ -22,7 +22,16 @@ Copy `config.example.json` to `~/.pi/agent/codex-seat-automation.local.json`, re
 }
 ```
 
-Set `automaticRecovery` to `true` if this Pi installation should switch seats automatically after a confirmed Codex quota failure; leave it `false` for manual-only `/as --auto` switching. A pending operation ID is kept under `~/.pi/agent/codex-seat-automation-runtime/` so process or network failure cannot create an accidental second rotation.
+Set `automaticRecovery` to `true` if this Pi installation should switch seats automatically after a confirmed Codex quota failure; leave it `false` for manual testing. A pending operation ID is kept under `~/.pi/agent/codex-seat-automation-runtime/` so process or network failure cannot create an accidental second rotation.
+
+Test mode does not select a model or publish provider sync:
+
+```text
+/codex-usage --refresh
+/seat-cycle-check
+```
+
+`/codex-usage --refresh` prints live usage for every logged-in account. `/seat-cycle-check` prints usage, requests exactly one signed seat rotation, waits for the unique usable account to move, and prints the final usage state.
 
 Automatic recovery can resume the interrupted main task directly through Pi. The `subagent` extension is optional; it is only needed for subagent continuation features.
 
