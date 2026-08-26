@@ -33,16 +33,6 @@ const DEFAULT_OPERATIONS: SeatCycleCheckOperations = {
 	sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
-export function installCodexSelectionTestMode(pi: ExtensionAPI) {
-	return pi.events.on(CODEX_ACCOUNT_SELECTION_MODE_CHANNEL, (value) => {
-		if (!value || typeof value !== "object") return;
-		const mode = value as { version?: unknown; selectionDisabled?: unknown };
-		if (mode.version === 1 && mode.selectionDisabled === false) {
-			mode.selectionDisabled = true;
-		}
-	});
-}
-
 export function installSeatCycleCheck(
 	pi: ExtensionAPI,
 	overrides: Partial<SeatCycleCheckOperations> = {},
@@ -50,6 +40,12 @@ export function installSeatCycleCheck(
 	const operations = { ...DEFAULT_OPERATIONS, ...overrides };
 	let sessionGeneration = 0;
 	let sessionActive = false;
+	let checkRunning = false;
+	const unsubscribeSelectionMode = pi.events.on(CODEX_ACCOUNT_SELECTION_MODE_CHANNEL, (value) => {
+		if (!checkRunning || !value || typeof value !== "object") return;
+		const mode = value as { version?: unknown; selectionDisabled?: unknown };
+		if (mode.version === 1 && mode.selectionDisabled === false) mode.selectionDisabled = true;
+	});
 	pi.on("session_start", () => {
 		sessionGeneration++;
 		sessionActive = true;
@@ -57,6 +53,8 @@ export function installSeatCycleCheck(
 	pi.on("session_shutdown", () => {
 		sessionGeneration++;
 		sessionActive = false;
+		checkRunning = false;
+		unsubscribeSelectionMode();
 	});
 
 	pi.registerCommand("seat-cycle-check", {
@@ -66,48 +64,57 @@ export function installSeatCycleCheck(
 				context.ui.notify("Usage: /seat-cycle-check", "warning");
 				return;
 			}
-			const generation = sessionGeneration;
-			const guard = () => sessionActive && generation === sessionGeneration;
-			const before = await operations.query(context);
-			const beforeProvider = soleUsableProvider(before);
-			context.ui.notify(`Before seat rotation:\n${formatCodexAccountUsage(before)}`, "info");
-			if (!beforeProvider) {
-				context.ui.notify(
-					"The initial usage state is not uniquely attributable; no seat was rotated.",
-					"warning",
-				);
+			if (checkRunning) {
+				context.ui.notify("A seat-cycle check is already running.", "warning");
 				return;
 			}
-			if (!guard()) return;
-
-			const seat = await operations.rotate(pi, context, guard);
-			if (seat.status !== "succeeded") {
-				context.ui.notify(
-					`Seat rotation ${seat.status}: ${seat.message}`,
-					seat.status === "failed" ? "error" : "warning",
-				);
-				return;
-			}
-
-			let after = before;
-			let afterProvider: string | undefined;
-			for (let attempt = 0; attempt < POLL_ATTEMPTS && guard(); attempt++) {
-				await operations.sleep(POLL_INTERVAL_MS);
+			checkRunning = true;
+			try {
+				const generation = sessionGeneration;
+				const guard = () => sessionActive && generation === sessionGeneration;
+				const before = await operations.query(context);
+				const beforeProvider = soleUsableProvider(before);
+				context.ui.notify(`Before seat rotation:\n${formatCodexAccountUsage(before)}`, "info");
+				if (!beforeProvider) {
+					context.ui.notify(
+						"The initial usage state is not uniquely attributable; no seat was rotated.",
+						"warning",
+					);
+					return;
+				}
 				if (!guard()) return;
-				after = await operations.query(context);
-				afterProvider = soleUsableProvider(after);
-				if (afterProvider && afterProvider !== beforeProvider) break;
+
+				const seat = await operations.rotate(pi, context, guard);
+				if (seat.status !== "succeeded") {
+					context.ui.notify(
+						`Seat rotation ${seat.status}: ${seat.message}`,
+						seat.status === "failed" ? "error" : "warning",
+					);
+					return;
+				}
+
+				let after = before;
+				let afterProvider: string | undefined;
+				for (let attempt = 0; attempt < POLL_ATTEMPTS && guard(); attempt++) {
+					await operations.sleep(POLL_INTERVAL_MS);
+					if (!guard()) return;
+					after = await operations.query(context);
+					afterProvider = soleUsableProvider(after);
+					if (afterProvider && afterProvider !== beforeProvider) break;
+				}
+				const moved = !!afterProvider && afterProvider !== beforeProvider;
+				context.ui.notify(
+					[
+						moved
+							? `Seat usage moved to ${afterProvider}.`
+							: "Seat rotated, but a unique changed usage holder was not observed before timeout.",
+						formatCodexAccountUsage(after),
+					].join("\n"),
+					moved ? "info" : "warning",
+				);
+			} finally {
+				checkRunning = false;
 			}
-			const moved = !!afterProvider && afterProvider !== beforeProvider;
-			context.ui.notify(
-				[
-					moved
-						? `Seat usage moved to ${afterProvider}.`
-						: "Seat rotated, but a unique changed usage holder was not observed before timeout.",
-					formatCodexAccountUsage(after),
-				].join("\n"),
-				moved ? "info" : "warning",
-			);
 		},
 	});
 }
