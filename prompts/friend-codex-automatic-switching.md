@@ -1,114 +1,114 @@
-# Install portable Codex automatic account switching
+# Prepare portable Codex switching code without activation
 
-Install the switching bundle from Anton’s public mirror:
+Fast-forward the installed Codex account/recovery bundle from Anton's sanitized public mirror:
 
+```text
 https://github.com/DebelToni/public-pi
-
-Do not install the `subagent` extension. This setup resumes an interrupted main task directly and does not require subagents.
-
-## 1. Copy the public extensions
-
-Use a temporary clone and copy only the switching bundle:
-
-```bash
-rm -rf /tmp/public-pi
-git clone --depth 1 https://github.com/DebelToni/public-pi.git /tmp/public-pi
-mkdir -p ~/.pi/agent/extensions/lib
-cp -R /tmp/public-pi/extensions/codex-accounts ~/.pi/agent/extensions/
-cp -R /tmp/public-pi/extensions/codex-provider-sync ~/.pi/agent/extensions/
-cp -R /tmp/public-pi/extensions/codex-seat-automation ~/.pi/agent/extensions/
-cp -R /tmp/public-pi/extensions/compaction ~/.pi/agent/extensions/
-cp /tmp/public-pi/extensions/lib/codex-provider-sync-control.ts ~/.pi/agent/extensions/lib/
-cp /tmp/public-pi/extensions/lib/internal-usage.ts ~/.pi/agent/extensions/lib/
 ```
 
-If any destination already exists, inspect it and preserve the user’s work instead of overwriting blindly.
+This is a **code preparation only** update. Keep every account Codex-only and leave seat automation disabled. Do not create or install a signing key, webhook URL, client mapping, or enabled local configuration. Do not run a live seat mutation. Do not install the `subagent` extension; interrupted main tasks resume directly without it.
 
-The installed seat-automation working directory is:
+## Safety preflight
+
+Work only under:
 
 ```text
-~/.pi/agent/extensions/codex-seat-automation
-```
-
-The temporary public source directory is `/tmp/public-pi/extensions/codex-seat-automation` and can be deleted after copying.
-
-Install the seat-request dependencies:
-
-```bash
-cd ~/.pi/agent/extensions/codex-seat-automation
-npm ci --ignore-scripts
-```
-
-## 2. Create the private local config
-
-Create:
-
-```text
+~/.pi/agent/extensions/
 ~/.pi/agent/codex-seat-automation.local.json
+~/.pi/agent/codex-auto-recovery-runtime/config.json
+~/tmp/
 ```
 
-Use values provisioned privately for this user. Never copy another machine’s private key or local paths:
+Do not inspect or print OAuth credential values. Do not modify `auth.json`, `codex-accounts.json`, provider/model state, saved quota history, pending-operation state, or any account login.
 
-```json
-{
-  "version": 1,
-  "enabled": true,
-  "automaticRecovery": true,
-  "keyId": "FRIEND_KEY_ID",
-  "privateKeyPath": "~/.ssh/FRIEND_PRIVATE_ED25519_KEY",
-  "macPublicKeyPath": "~/.pi/agent/extensions/codex-seat-automation/mac-webhook.pub",
-  "url": "PRIVATE_WEBHOOK_URL"
-}
-```
+Before changing source files:
 
-Requirements:
+1. Confirm no `/as --auto` or `/seat-cycle-check` operation is running.
+2. If `~/.pi/agent/codex-seat-automation.local.json` exists, inspect only its `enabled` and `automaticRecovery` booleans. Stop without changing anything unless both are `false`.
+3. If `~/.pi/agent/codex-auto-recovery-runtime/config.json` exists, inspect only its `enabled` boolean. Stop unless it is `false`.
+4. Record the current provider/model without changing it.
 
-- The sender private key and webhook URL must be delivered privately, not fetched from GitHub.
-- The sender private key must be owner-readable only.
-- The local config must be mode `0600`.
-- The Mac public key is public, but its configured local path must exist.
-- The key ID must already be approved by the Mac-side service.
-- `automaticRecovery: true` enables switching after a confirmed Codex quota failure.
+## Install the exact public release
 
-Apply permissions:
+Anton will provide an immutable public commit as `PUBLIC_PI_REF`. Refuse a branch name such as `main`; require a full 40-character lowercase commit hash.
+
+Use a fresh owner-only staging directory and verify that checkout exactly:
 
 ```bash
-chmod 600 ~/.pi/agent/codex-seat-automation.local.json
-chmod 600 ~/.ssh/FRIEND_PRIVATE_ED25519_KEY
+if ! printf '%s' "${PUBLIC_PI_REF:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "PUBLIC_PI_REF must be one full commit hash" >&2
+  exit 1
+fi
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+staging="$HOME/tmp/friend-public-pi-$stamp"
+backup="$HOME/tmp/friend-codex-backup-$stamp"
+umask 077
+mkdir -p "$staging" "$backup/extensions"
+git clone --no-checkout https://github.com/DebelToni/public-pi.git "$staging/repo"
+git -C "$staging/repo" checkout --detach "$PUBLIC_PI_REF"
+test "$(git -C "$staging/repo" rev-parse HEAD)" = "$PUBLIC_PI_REF"
 ```
 
-### Passphrase-protected private keys
-
-The client supports encrypted OpenSSH keys through the `WEBHOOK_KEY_PASSPHRASE` environment variable. Never place the passphrase in the JSON config, this prompt, shell history, or a shared file.
-
-For one supervised Pi launch in macOS zsh, enter it without echoing or saving it:
+Stage the coordinated bundle and install its dependency lockfile without scripts:
 
 ```bash
-IFS= read -rs "WEBHOOK_KEY_PASSPHRASE?Seat key passphrase: "
-printf '\n'
-export WEBHOOK_KEY_PASSPHRASE
-pi
-unset WEBHOOK_KEY_PASSPHRASE
+mkdir -p "$staging/install/extensions/lib"
+for name in codex-accounts codex-provider-sync codex-seat-automation compaction model-status; do
+  cp -a "$staging/repo/extensions/$name" "$staging/install/extensions/"
+done
+for name in codex-provider-sync-control.ts fast-mode.ts internal-usage.ts; do
+  cp -a "$staging/repo/extensions/lib/$name" "$staging/install/extensions/lib/"
+done
+
+cd "$staging/install/extensions/codex-seat-automation"
+npm ci --omit=dev --ignore-scripts
 ```
 
-An already-running Pi cannot inherit a newly exported variable; relaunch it from that shell. The preserved pending operation ID will be reused safely.
+Move only the existing source bundle into the owner-only backup, then install the staged replacement. Never move or copy runtime state:
 
-For unattended automatic recovery on macOS, store the passphrase in the login Keychain and launch Pi through a local wrapper that reads it at startup. Do not publish that wrapper with machine-specific paths. Alternatively, provision a new dedicated seat-signing key and register its public half on the Mac-side service.
+```bash
+mkdir -p "$backup/extensions/lib" "$HOME/.pi/agent/extensions/lib"
+for name in codex-accounts codex-provider-sync codex-seat-automation compaction model-status; do
+  if [ -e "$HOME/.pi/agent/extensions/$name" ]; then
+    mv "$HOME/.pi/agent/extensions/$name" "$backup/extensions/"
+  fi
+  mv "$staging/install/extensions/$name" "$HOME/.pi/agent/extensions/"
+done
+for name in codex-provider-sync-control.ts fast-mode.ts internal-usage.ts; do
+  if [ -e "$HOME/.pi/agent/extensions/lib/$name" ]; then
+    mv "$HOME/.pi/agent/extensions/lib/$name" "$backup/extensions/lib/"
+  fi
+  mv "$staging/install/extensions/lib/$name" "$HOME/.pi/agent/extensions/lib/"
+done
+chmod -R go-rwx "$backup"
+```
 
-## 3. Validate without rotating a seat
+Do not copy the `subagent` extension or any local/runtime JSON file from the repository, staging directory, backup, or another machine.
 
-1. Reload Pi with `/reload`.
-2. Log in to the user’s configured Codex accounts.
-3. Run `/codex-auto-recovery status`; it must report enabled.
-4. Confirm the desired `codex-piN` providers appear under `/model`.
-5. Do not run `/as --auto` merely to test installation because it performs a real seat rotation.
+## Verify without activation
 
-Expected behavior after a confirmed quota exhaustion:
+Run the repository's existing tests for the copied extensions using the runtimes already installed on the machine. Also run:
 
-1. Confirm that the current provider really exhausted its quota.
-2. Submit one durable signed seat-rotation request.
-3. Wait for the Mac-side operation to finish.
-4. Select the first verified usable account.
-5. Continue the interrupted main task without requiring `subagent`.
+```bash
+pi --list-models
+```
 
-The remote caller cannot choose a pool, member, or target account. The Mac-side mapping decides which configured seat is rotated.
+Verification must not:
+
+- invoke `/as --auto` or `/seat-cycle-check`;
+- create `codex-seat-automation.local.json`;
+- enable `/codex-auto-recovery`;
+- change the active provider/model;
+- refresh, remove, or re-login an OAuth account;
+- install or copy private key material.
+
+After tests pass, ask the user to type `/reload` once in each active Pi process. Do not inject input or restart a process. After reload, confirm the previously selected provider/model is unchanged and report that seat automation remains unconfigured/disabled.
+
+Finish by reporting:
+
+- installed public commit;
+- tests and load-check results;
+- backup directory;
+- whether either disabled configuration file already existed;
+- confirmation that no seat mutation, account selection, OAuth change, or server activation occurred.

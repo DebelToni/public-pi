@@ -18,7 +18,7 @@ export function soleUsableProvider(entries: readonly CodexAccountUsageEntry[]) {
 }
 
 type SeatCycleCheckOperations = {
-	query(context: ExtensionContext, forceRefresh: boolean): Promise<CodexAccountUsageEntry[]>;
+	query(context: ExtensionContext): Promise<CodexAccountUsageEntry[]>;
 	rotate(
 		pi: ExtensionAPI,
 		context: ExtensionContext,
@@ -68,7 +68,7 @@ export function installSeatCycleCheck(
 			}
 			const generation = sessionGeneration;
 			const guard = () => sessionActive && generation === sessionGeneration;
-			const before = await operations.query(context, true);
+			const before = await operations.query(context);
 			const beforeProvider = soleUsableProvider(before);
 			context.ui.notify(`Before seat rotation:\n${formatCodexAccountUsage(before)}`, "info");
 			if (!beforeProvider) {
@@ -94,7 +94,7 @@ export function installSeatCycleCheck(
 			for (let attempt = 0; attempt < POLL_ATTEMPTS && guard(); attempt++) {
 				await operations.sleep(POLL_INTERVAL_MS);
 				if (!guard()) return;
-				after = await operations.query(context, attempt === 0);
+				after = await operations.query(context);
 				afterProvider = soleUsableProvider(after);
 				if (afterProvider && afterProvider !== beforeProvider) break;
 			}

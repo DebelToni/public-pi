@@ -5,4 +5,5 @@ node_modules/
 auth*
 codex-accounts.json
 codex-provider-sync*.json
+codex-usage-history.json
 sessions/

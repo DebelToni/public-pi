@@ -13,25 +13,26 @@ Copy `config.example.json` to `~/.pi/agent/codex-seat-automation.local.json`, re
 ```json
 {
   "version": 1,
-  "enabled": true,
+  "enabled": false,
   "automaticRecovery": false,
-  "keyId": "friend-1",
+  "keyId": "REPLACE_WITH_APPROVED_KEY_ID",
   "privateKeyPath": "~/.ssh/REPLACE_WITH_THE_SENDER_ED25519_KEY",
   "macPublicKeyPath": "~/.pi/agent/extensions/codex-seat-automation/mac-webhook.pub",
   "url": "https://REPLACE_WITH_THE_DEPLOYED_WEBHOOK_URL"
 }
 ```
 
-Set `automaticRecovery` to `true` if this Pi installation should switch seats automatically after a confirmed Codex quota failure; leave it `false` for manual testing. A pending operation ID is kept under `~/.pi/agent/codex-seat-automation-runtime/` so process or network failure cannot create an accidental second rotation.
+Leave both flags `false` while installing code without activation. After separate server-side authorization and private provisioning, set `enabled` and `automaticRecovery` to `true` if this Pi installation should switch seats automatically after an exact Codex quota failure. Recovery rotates when live quota reports less than 10% remaining; at 10% or more it retries once on the same account instead. A pending operation ID is kept under `~/.pi/agent/codex-seat-automation-runtime/` so process or network failure cannot create an accidental second rotation.
 
 Test mode does not select a model or publish provider sync:
 
 ```text
-/codex-usage --refresh
+/codex-usage
+/codex-usage --saved
 /seat-cycle-check
 ```
 
-`/codex-usage --refresh` prints live usage for every logged-in account. `/seat-cycle-check` prints usage, requests exactly one signed seat rotation, waits for the unique usable account to move, and prints the final usage state.
+`/codex-usage` shows live 5-hour and weekly windows without forcing OAuth refresh. Successful quota responses atomically update owner-only snapshots in `~/.pi/agent/codex-usage-history.json`; usage-based responses and errors retain the previous snapshot. `--saved` performs no network request. `/seat-cycle-check` prints usage, requests exactly one signed seat rotation, waits for the unique usable account to move, and prints the final state. A verified v2 response reports `previous → selected` immediately, then activation queries only the selected account; older v1 responses fall back to the all-account scan. If local activation fails, `/as <selected> <model>` remains available for manual selection. OAuth tokens refresh automatically near expiry; forced refresh flags are rejected.
 
 Automatic recovery can resume the interrupted main task directly through Pi. The `subagent` extension is optional; it is only needed for subagent continuation features.
 

@@ -74,7 +74,7 @@ Set `PI_FORK_TMUX_LAUNCHER` when `/fork-tmux` should launch a wrapper instead of
 - `codex-seat-automation` — signed remote seat rotation and automatic recovery.
 - `compaction` — custom compaction and quota-failure signaling.
 
-Automatic seat recovery requires local private provisioning. Follow [`prompts/friend-codex-automatic-switching.md`](prompts/friend-codex-automatic-switching.md).
+The public bundle can be installed while seat automation remains disabled. Follow [`prompts/friend-codex-automatic-switching.md`](prompts/friend-codex-automatic-switching.md); private provisioning and activation are deliberately separate.
 
 ### Agent and safety infrastructure
 
@@ -87,7 +87,7 @@ Automatic seat recovery requires local private provisioning. Follow [`prompts/fr
 
 ## Deliberate exclusions
 
-The mirror excludes credentials, private endpoints, local configuration, sessions, logs, runtime databases, context/wiki content, generated telemetry, Anton's wiki mode, quota-history dashboard, Google Chrome GUI automation, swear-meter pipeline, and title/wiki integration.
+The mirror excludes credentials, private endpoints, local configuration, sessions, logs, runtime databases (including saved quota history), context/wiki content, generated telemetry, Anton's wiki mode, Google Chrome GUI automation, swear-meter pipeline, and title/wiki integration.
 
 ## Mirror maintenance
 

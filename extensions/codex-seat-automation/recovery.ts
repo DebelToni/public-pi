@@ -4,6 +4,8 @@ import {
 	queryCodexProviderUsage,
 	requestCodexAccountSelection,
 	requestCodexSeatChange,
+	verifiedSeatActivationFailureMessage,
+	verifiedSeatChangeMessage,
 	type CodexUsageStatus,
 } from "../codex-accounts/index.js";
 import {
@@ -64,6 +66,7 @@ function parseUsageLimitSignal(value: unknown): CodexUsageLimitSignal | undefine
 
 const AUTO_RECOVERY_STATUS_KEY = "codex-auto-recovery";
 const CODEX_QUOTA_EVENT_CHANNEL = "codex-quota-log:event:v1";
+export const AUTO_RECOVERY_USAGE_THRESHOLD_PERCENT = 10;
 const AUTO_RECOVERY_POLL_MS = 250;
 const AUTO_RECOVERY_WAIT_TIMEOUT_MS = 20 * 60_000;
 
@@ -133,11 +136,10 @@ async function requestRecoveryReplacement(
 		);
 		return undefined;
 	}
-	const selection = await requestCodexAccountSelection(pi, context, model, guard);
+	context.ui.notify(verifiedSeatChangeMessage(seat), "info");
+	const selection = await requestCodexAccountSelection(pi, context, model, guard, seat.accountLabel);
 	if (selection.status !== "selected") {
-		if (selection.code === "selection-handler-unavailable") {
-			context.ui.notify(`Codex recovery selection failed: ${selection.message}`, "error");
-		}
+		context.ui.notify(verifiedSeatActivationFailureMessage(seat, model, selection.message), "error");
 		return undefined;
 	}
 	return { provider: selection.provider, modelId: selection.modelId, syncId: selection.syncId };
@@ -307,17 +309,19 @@ export function installAutoRecovery(
 				await fail("session-ended");
 				return;
 			}
-			if (failedUsage.score !== 0) {
+			if (failedUsage.score < 0 || failedUsage.score >= AUTO_RECOVERY_USAGE_THRESHOLD_PERCENT) {
 				await fail(
 					"quota-not-exhausted",
-					`Codex automatic recovery did not switch accounts because the usage endpoint reported ${failedUsage.label}.`,
+					`Codex automatic recovery did not switch accounts because live usage reported ${failedUsage.label}; automatic rotation requires less than ${AUTO_RECOVERY_USAGE_THRESHOLD_PERCENT}% remaining.`,
 				);
 				return;
 			}
-			notify(context, "Confirmed ChatGPT subscription exhaustion; selecting a replacement account…", "warning");
-			if (failedUsage.label === "rate limit reached") {
-				await recordQuotaEvent(pi, "confirmed-exhaustion", candidate.provider);
-			}
+			notify(
+				context,
+				`Confirmed an exact ChatGPT usage-limit error with ${failedUsage.label}; selecting a replacement account because less than ${AUTO_RECOVERY_USAGE_THRESHOLD_PERCENT}% remains…`,
+				"warning",
+			);
+			await recordQuotaEvent(pi, "confirmed-exhaustion", candidate.provider);
 			if (!syncUnchanged()) {
 				await fail("provider-changed", "Codex automatic recovery stopped because the global provider changed.");
 				return;

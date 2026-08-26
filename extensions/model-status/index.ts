@@ -122,6 +122,11 @@ function isCodexProvider(provider?: string) {
 	return provider === "openai-codex" || !!provider?.startsWith("codex-");
 }
 
+export function codexAccountMarker(provider?: string) {
+	const match = /^codex-pi([1-9]\d*)$/.exec(provider ?? "");
+	return match ? `a:${match[1]}` : undefined;
+}
+
 function isOpenAIProvider(provider?: string) {
 	return provider === "openai" || provider === "openai-responses" || isCodexProvider(provider);
 }
@@ -262,6 +267,7 @@ function statusText(ctx: ExtensionContext, width: number) {
 	const model = ctx.model ? ctx.model.id : "no-model";
 	const fast = isFastEnabledFor(ctx) ? "f" : "";
 	const think = thinkingLetter();
+	const account = codexAccountMarker(ctx.model?.provider);
 	const planSnapshot = !ctx.model?.provider ? undefined : planUsageByProvider.get(ctx.model.provider);
 	const planParts: string[] = [];
 	if (state.planUsageEnabled !== false && planSnapshot) planParts.push(planSnapshot.usage);
@@ -271,7 +277,8 @@ function statusText(ctx: ExtensionContext, width: number) {
 	const plan = planParts.length ? ` ${planParts.join(" ")}` : "";
 	const tps = state.tpsEnabled && state.tps ? ` t:${state.tps}` : "";
 	const prefix = state.modelPrefix ? `${state.modelPrefix} ` : "";
-	const raw = `${prefix}${model}${fast}${think} c:${fmtTokens(usage.total)}${plan}${tps}`;
+	const accountText = account ? ` ${account}` : "";
+	const raw = `${prefix}${model}${fast}${think}${accountText} c:${fmtTokens(usage.total)}${plan}${tps}`;
 	const right = truncateToWidth(raw, width, "...");
 	const rightWidth = visibleWidth(right);
 	const maxLeftWidth = width - rightWidth - 1;

@@ -275,17 +275,59 @@ function commonOptions(config: SeatAutomationConfigV1, operationId: string): Web
 	};
 }
 
+function runnerCode(result: VerifiedWebhookResult) {
+	const runner = result.job?.result?.data.runner;
+	return isRecord(runner) && typeof runner.code === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(runner.code)
+		? runner.code
+		: undefined;
+}
+
+function verifiedRunnerTransition(result: VerifiedWebhookResult) {
+	const runner = result.job?.result?.data.runner;
+	if (!isRecord(runner) || runner.version === 1) return undefined;
+	if (
+		runner.version !== 2 ||
+		!exactKeys(runner, new Set([
+			"version",
+			"ok",
+			"code",
+			"uncertain",
+			"pool",
+			"previous_account",
+			"selected_account",
+		])) ||
+		runner.ok !== true ||
+		runner.uncertain !== false ||
+		(runner.code !== "success" && runner.code !== "success_reconciled") ||
+		typeof runner.previous_account !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(runner.previous_account) ||
+		typeof runner.selected_account !== "string" ||
+		!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(runner.selected_account) ||
+		runner.previous_account === runner.selected_account
+	) {
+		throw new Error("The signed Mac response contains an invalid verified seat transition.");
+	}
+	return {
+		previousAccountLabel: runner.previous_account,
+		accountLabel: runner.selected_account,
+	};
+}
+
 function terminalResult(result: VerifiedWebhookResult, operationId: string, dependencies: TransportDependencies) {
 	const job = result.job;
 	if (!job?.isTerminal) return undefined;
+	const detail = runnerCode(result);
+	const detailText = detail ? ` (runner code: ${detail})` : "";
 	if (job.state === "uncertain") {
-		return failed("The Mac reported an uncertain seat outcome; Anton must review it before another switch.");
+		return failed(`The Mac reported an uncertain seat outcome${detailText}; Anton must review it before another switch.`);
+	}
+	if (job.state === "succeeded" && job.result?.ok === true) {
+		const transition = verifiedRunnerTransition(result);
+		dependencies.clearPending(operationId);
+		return { version: 1, status: "succeeded", ...transition } satisfies CodexSeatRequestResultV1;
 	}
 	dependencies.clearPending(operationId);
-	if (job.state === "succeeded" && job.result?.ok === true) {
-		return { version: 1, status: "succeeded" } satisfies CodexSeatRequestResultV1;
-	}
-	return failed(job.result?.message || "The Mac rejected the seat operation.");
+	return failed(`${job.result?.message || "The Mac rejected the seat operation."}${detailText}`);
 }
 
 export async function executeSeatRequestV1(

@@ -151,7 +151,7 @@ function recoveryHarness(
 			calls.completions++;
 			if (options.failCompletion) throw new Error("fake coordinator write failure");
 			if (options.uncommittedCompletion) return { committed: false };
-			if ((options.usageScore ?? 0) > 0) {
+			if ((options.usageScore ?? 0) < 0 || (options.usageScore ?? 0) >= 10) {
 				expect({ generation, result, selection, failureCode }).toEqual({
 					generation: 1,
 					result: "failed",
@@ -306,6 +306,35 @@ describe("automatic recovery flow", () => {
 			harness.setIdle(true);
 			await harness.emit("agent_settled");
 			await expectSuccessfulRecovery(harness);
+		} finally {
+			await harness.shutdown();
+		}
+	});
+
+	test("an exact quota error rotates when live usage is below ten percent", async () => {
+		const harness = recoveryHarness(new FakeEventBus(), { usageScore: 9 });
+		try {
+			await harness.emit("before_provider_request");
+			await harness.emit("message_end", { message: assistant("Codex error: The usage limit has been reached") });
+			harness.setIdle(true);
+			await harness.emit("agent_settled");
+			await expectSuccessfulRecovery(harness);
+			expect(harness.notices.some((notice) => notice.includes("less than 10% remains"))).toBe(true);
+		} finally {
+			await harness.shutdown();
+		}
+	});
+
+	test("ten percent remaining keeps the account and retries once", async () => {
+		const harness = recoveryHarness(new FakeEventBus(), { usageScore: 10 });
+		try {
+			await harness.emit("before_provider_request");
+			await harness.emit("message_end", { message: assistant("Codex error: The usage limit has been reached") });
+			harness.setIdle(true);
+			await harness.emit("agent_settled");
+			await waitFor(() => harness.calls.continuations === 1, "threshold boundary did not retry");
+			expect(harness.calls.selections).toBe(0);
+			expect(harness.notices.some((notice) => notice.includes("requires less than 10% remaining"))).toBe(true);
 		} finally {
 			await harness.shutdown();
 		}

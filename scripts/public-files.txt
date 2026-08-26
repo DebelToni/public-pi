@@ -11,6 +11,7 @@ extensions/cli-fast/index.test.ts
 extensions/cli-fast/index.ts
 extensions/codex-accounts/auto-recovery.ts
 extensions/codex-accounts/boundary.test.ts
+extensions/codex-accounts/index.test.ts
 extensions/codex-accounts/index.ts
 extensions/codex-provider-sync/index.ts
 extensions/codex-seat-automation/README.md

@@ -62,6 +62,7 @@ function hookHarness(transport: Parameters<typeof installSeatRequestHook>[1]) {
 
 function response(
 	state: "accepted" | "running" | "succeeded" | "failed" | "uncertain",
+	runner?: Record<string, unknown>,
 ): VerifiedWebhookResult {
 	const terminal = ["succeeded", "failed", "uncertain"].includes(state);
 	const successful = state === "succeeded";
@@ -75,7 +76,12 @@ function response(
 			operationId: OPERATION_ID,
 			state,
 			result: terminal
-				? { ok: successful, code: successful ? "SEAT_ROTATED" : "FAILED", message: "terminal", data: {} }
+				? {
+					ok: successful,
+					code: successful ? "SEAT_ROTATED" : "FAILED",
+					message: "terminal",
+					data: runner ? { runner } : {},
+				}
 				: null,
 			isTerminal: terminal,
 		},
@@ -137,6 +143,47 @@ test("one persisted operation is submitted and cleared only after signed success
 	expect(fake.generated).toBe(1);
 	expect(fake.pending).toBeUndefined();
 	expect(fake.clears).toBe(1);
+});
+
+test("verified runner v2 success returns the exact account transition", async () => {
+	const fake = dependencies({
+		rotate: async () => response("succeeded", {
+			version: 2,
+			ok: true,
+			code: "success",
+			uncertain: false,
+			pool: "team-a",
+			previous_account: "account3",
+			selected_account: "account4",
+		}),
+	});
+	const result = await executeSeatRequestV1({ version: 1, context, guard: () => true }, fake.values);
+	expect(result).toEqual({
+		version: 1,
+		status: "succeeded",
+		previousAccountLabel: "account3",
+		accountLabel: "account4",
+	});
+	expect(fake.pending).toBeUndefined();
+});
+
+test("malformed runner v2 transition preserves the operation for review", async () => {
+	const fake = dependencies({
+		rotate: async () => response("succeeded", {
+			version: 2,
+			ok: true,
+			code: "success",
+			uncertain: false,
+			pool: "team-a",
+			previous_account: "account3",
+			selected_account: "account3",
+		}),
+	});
+	const result = await executeSeatRequestV1({ version: 1, context, guard: () => true }, fake.values);
+	expect(result.status).toBe("failed");
+	expect(result.status === "failed" && result.message).toContain("invalid verified seat transition");
+	expect(fake.pending?.operationId).toBe(OPERATION_ID);
+	expect(fake.clears).toBe(0);
 });
 
 test("a lost submission response retries the same operation ID", async () => {

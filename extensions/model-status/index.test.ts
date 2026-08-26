@@ -2,10 +2,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import modelStatus, { formatResetRemaining, quotaResetAtMs } from "./index.ts";
+import modelStatus, { codexAccountMarker, formatResetRemaining, quotaResetAtMs } from "./index.ts";
 
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
+
+test("numbered business providers render a compact account marker", () => {
+	assert.equal(codexAccountMarker("codex-pi19"), "a:19");
+	assert.equal(codexAccountMarker("codex-pi1"), "a:1");
+	assert.equal(codexAccountMarker("codex-pro"), undefined);
+	assert.equal(codexAccountMarker("codex-team4"), undefined);
+	assert.equal(codexAccountMarker("codex-pi0"), undefined);
+});
 
 test("quota reset timestamps support absolute and relative API fields", () => {
 	const now = Date.UTC(2026, 7, 16, 12, 0, 0);
@@ -79,6 +87,10 @@ test("status refresh is background-only and shared usage/reset data is throttled
 	assert.deepEqual(fetches, ["personal", "business"], "different providers may refresh concurrently");
 
 	const footer = footerFactory({ requestRender() {} });
+	assert.doesNotMatch(footer.render(120)[0], /a:/);
+	context.model.provider = "codex-pi19";
+	assert.match(footer.render(120)[0], /gpt-5\.6-solh a:19 c:1\.0k/);
+	context.model.provider = "codex-pro";
 	assert.match(footer.render(120)[0], /u:92% r:5d/);
 	await commands.get("usage").handler("off", context);
 	assert.doesNotMatch(footer.render(120)[0], /u:/);

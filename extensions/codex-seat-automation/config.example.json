@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "enabled": true,
+  "enabled": false,
   "automaticRecovery": false,
-  "keyId": "friend-1",
-  "privateKeyPath": "~/.ssh/REPLACE_WITH_EXISTING_FRIEND_KEY",
+  "keyId": "REPLACE_WITH_APPROVED_KEY_ID",
+  "privateKeyPath": "~/.ssh/REPLACE_WITH_SENDER_ED25519_KEY",
   "macPublicKeyPath": "~/.pi/agent/extensions/codex-seat-automation/mac-webhook.pub",
   "url": "https://REPLACE_WITH_THE_DEPLOYED_WEBHOOK_URL"
 }

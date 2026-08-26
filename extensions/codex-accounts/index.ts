@@ -14,6 +14,7 @@ import { dirname, join } from "node:path";
 
 const STORAGE_PATH = join(getAgentDir(), "codex-accounts.json");
 const SYNC_STATE_PATH = join(getAgentDir(), "codex-provider-sync.json");
+const USAGE_HISTORY_PATH = join(getAgentDir(), "codex-usage-history.json");
 const PROVIDER_PREFIX = "codex-";
 const BASE_PROVIDER = "openai-codex";
 const GPT_5_6_CODEX_CONTEXT_WINDOW = 372_000;
@@ -60,7 +61,12 @@ type RuntimeCredentialAccess = {
 export type CodexOperationGuard = () => boolean;
 
 export type CodexSeatRequestResultV1 =
-	| { version: 1; status: "succeeded" }
+	| {
+		version: 1;
+		status: "succeeded";
+		previousAccountLabel?: string;
+		accountLabel?: string;
+	}
 	| { version: 1; status: "unavailable" | "failed"; message: string };
 
 export type CodexSeatRequestV1 = {
@@ -92,19 +98,49 @@ export type CodexSelectionRequestV1 = {
 	version: 1;
 	context: ExtensionContext;
 	modelId: string;
+	accountLabel?: string;
 	guard: CodexOperationGuard;
 	run?: Promise<CodexSelectionResultV1>;
 };
 
-export type CodexUsageStatus = { score: number; label: string };
+export type CodexQuotaWindow = {
+	label: string;
+	usedPercent: number;
+	leftPercent: number;
+	limitWindowSeconds?: number;
+	resetAtMs?: number;
+};
+
+export type CodexUsageStatus = {
+	score: number;
+	label: string;
+	planType?: string;
+	observedAt: number;
+	windows: CodexQuotaWindow[];
+};
+
+export type CodexUsageSnapshot = {
+	label: string;
+	providerId: string;
+	planType?: string;
+	observedAt: number;
+	windows: CodexQuotaWindow[];
+};
+
 export type CodexAccountUsageEntry = {
 	label: string;
 	providerId: string;
 	usage?: CodexUsageStatus;
 	error?: string;
+	saved?: CodexUsageSnapshot;
 };
 
-type AutoSubscriptionOptions = { forceRefresh?: boolean; accountLabel?: string };
+type UsageHistoryShape = {
+	version: 1;
+	accounts: Record<string, CodexUsageSnapshot>;
+};
+
+type AutoSubscriptionOptions = { accountLabel?: string };
 type UsageCheck =
 	| { account: StoredAccount; usage: CodexUsageStatus }
 	| { account: StoredAccount; error: string };
@@ -113,6 +149,9 @@ type SelectionPolicy = {
 	postSeat: boolean;
 	suppressProviderSync: boolean;
 };
+
+const HOUR_MS = 60 * 60_000;
+const DAY_MS = 24 * HOUR_MS;
 
 function modelRuntime(ctx: ExtensionContext) {
 	const runtime = (ctx.modelRegistry as unknown as { runtime?: RuntimeCredentialAccess }).runtime;
@@ -304,52 +343,130 @@ function accountIdFromJwt(token: string): string | undefined {
 	}
 }
 
-export function parseCodexUsageStatus(data: any): CodexUsageStatus | undefined {
-	if (data?.rate_limit?.limit_reached === true) return { score: 0, label: "rate limit reached" };
+function finiteNumber(value: unknown) {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+export function quotaResetAtMs(window: any, observedAt: number) {
+	const absolute = finiteNumber(window?.reset_at);
+	if (absolute !== undefined && absolute > 0) return absolute > 10_000_000_000 ? absolute : absolute * 1000;
+	const remaining = finiteNumber(window?.reset_after_seconds);
+	return remaining !== undefined && remaining >= 0 ? observedAt + remaining * 1000 : undefined;
+}
+
+export function quotaWindowLabel(limitWindowSeconds: number | undefined, fallback: string) {
+	if (limitWindowSeconds === undefined) return fallback;
+	if (Math.abs(limitWindowSeconds - 5 * 60 * 60) <= 60) return "5h";
+	if (Math.abs(limitWindowSeconds - 7 * 24 * 60 * 60) <= 60) return "weekly";
+	if (limitWindowSeconds % (24 * 60 * 60) === 0) return `${limitWindowSeconds / (24 * 60 * 60)}d`;
+	if (limitWindowSeconds % (60 * 60) === 0) return `${limitWindowSeconds / (60 * 60)}h`;
+	return fallback;
+}
+
+function parseQuotaWindow(raw: any, fallback: string, observedAt: number): CodexQuotaWindow | undefined {
+	const used = finiteNumber(raw?.used_percent);
+	if (used === undefined) return undefined;
+	const usedPercent = Math.max(0, Math.min(100, Math.round(used)));
+	const limitWindowSeconds = finiteNumber(raw?.limit_window_seconds);
+	return {
+		label: quotaWindowLabel(limitWindowSeconds, fallback),
+		usedPercent,
+		leftPercent: 100 - usedPercent,
+		...(limitWindowSeconds !== undefined ? { limitWindowSeconds } : {}),
+		...(quotaResetAtMs(raw, observedAt) !== undefined ? { resetAtMs: quotaResetAtMs(raw, observedAt) } : {}),
+	};
+}
+
+export function formatRemaining(resetAtMs: number, now = Date.now()) {
+	const remaining = Math.max(0, resetAtMs - now);
+	const days = Math.floor(remaining / DAY_MS);
+	const hours = Math.floor((remaining % DAY_MS) / HOUR_MS);
+	const minutes = Math.floor((remaining % HOUR_MS) / 60_000);
+	if (days > 0) return `${days}d ${hours}h`;
+	if (hours > 0) return `${hours}h ${minutes}m`;
+	return `${minutes}m`;
+}
+
+export function formatQuotaWindow(window: CodexQuotaWindow, now = Date.now()) {
+	const reset = window.resetAtMs === undefined ? "reset unknown" : `resets in ${formatRemaining(window.resetAtMs, now)}`;
+	return `${window.label}: ${window.leftPercent}% left (${reset})`;
+}
+
+export function parseCodexUsageStatus(data: any, observedAt = Date.now()): CodexUsageStatus | undefined {
+	const planType = typeof data?.plan_type === "string" ? data.plan_type : undefined;
+	const windows = [
+		parseQuotaWindow(data?.rate_limit?.primary_window, "primary", observedAt),
+		parseQuotaWindow(data?.rate_limit?.secondary_window, "secondary", observedAt),
+	].filter((window): window is CodexQuotaWindow => window !== undefined)
+		.sort((left, right) => (left.limitWindowSeconds ?? Number.MAX_SAFE_INTEGER) - (right.limitWindowSeconds ?? Number.MAX_SAFE_INTEGER));
+	if (windows.length) {
+		const limitReached = data?.rate_limit?.limit_reached === true;
+		const score = limitReached ? 0 : Math.min(...windows.map((window) => window.leftPercent));
+		return {
+			score,
+			label: limitReached ? "rate limit reached" : windows.map((window) => `${window.label} ${window.leftPercent}% left`).join(" · "),
+			...(planType ? { planType } : {}),
+			observedAt,
+			windows,
+		};
+	}
 	if (data?.spend_control?.reached === true || data?.credits?.overage_limit_reached === true) {
-		return { score: 0, label: "spend limit reached" };
+		return { score: 0, label: "spend limit reached", ...(planType ? { planType } : {}), observedAt, windows: [] };
 	}
-	const used = data?.rate_limit?.primary_window?.used_percent;
-	if (typeof used === "number" && !Number.isNaN(used)) {
-		const left = Math.max(0, Math.min(100, Math.round(100 - used)));
-		return { score: left, label: `${left}% left` };
+	if (data?.rate_limit?.allowed === true) {
+		return { score: 100, label: "allowed", ...(planType ? { planType } : {}), observedAt, windows: [] };
 	}
-	if (data?.rate_limit?.allowed === true) return { score: 100, label: "allowed" };
 	if (data?.spend_control?.reached === false && data?.credits?.overage_limit_reached !== true) {
-		return { score: -1, label: "usage-based/skipped" };
+		return { score: -1, label: "usage-based/skipped", ...(planType ? { planType } : {}), observedAt, windows: [] };
 	}
 	return undefined;
 }
 
-async function forceRefreshOAuth(ctx: ExtensionContext, account: StoredAccount) {
-	const credentials = modelRuntime(ctx).credentials;
-	let previousCredential: OAuthCredential | undefined;
-	let expiredCredential: OAuthCredential | undefined;
-	await credentials.modify(account.providerId, async (current) => {
-		if (current?.type !== "oauth") throw new Error("missing Codex OAuth credentials");
-		previousCredential = current;
-		expiredCredential = { ...current, expires: 0 };
-		return expiredCredential;
-	});
+export function loadCodexUsageHistory(path = USAGE_HISTORY_PATH): UsageHistoryShape {
 	try {
-		const token = await ctx.modelRegistry.getApiKeyForProvider(account.providerId);
-		if (!token) throw new Error("OAuth refresh failed");
-	} catch (error) {
-		await credentials.modify(account.providerId, async (current) => {
-			if (
-				current?.type !== "oauth" ||
-				!expiredCredential ||
-				!previousCredential ||
-				current.expires !== 0 ||
-				current.access !== expiredCredential.access ||
-				current.refresh !== expiredCredential.refresh
-			) {
-				return current;
-			}
-			return previousCredential;
-		});
-		throw error;
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		if (parsed?.version === 1 && parsed.accounts && typeof parsed.accounts === "object") return parsed;
+	} catch {}
+	return { version: 1, accounts: {} };
+}
+
+export function saveCodexUsageSnapshots(snapshots: readonly CodexUsageSnapshot[], path = USAGE_HISTORY_PATH) {
+	if (!snapshots.length) return;
+	const history = loadCodexUsageHistory(path);
+	for (const snapshot of snapshots) history.accounts[snapshot.providerId] = snapshot;
+	mkdirSync(dirname(path), { recursive: true });
+	const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(temporaryPath, `${JSON.stringify(history, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		chmodSync(temporaryPath, 0o600);
+		renameSync(temporaryPath, path);
+		chmodSync(path, 0o600);
+	} finally {
+		try { unlinkSync(temporaryPath); } catch {}
 	}
+}
+
+function snapshotFor(account: StoredAccount, usage: CodexUsageStatus): CodexUsageSnapshot | undefined {
+	if (!usage.windows.length) return undefined;
+	return {
+		label: account.label,
+		providerId: account.providerId,
+		...(usage.planType ? { planType: usage.planType } : {}),
+		observedAt: usage.observedAt,
+		windows: usage.windows,
+	};
+}
+
+function formatError(error: unknown) {
+	if (!(error instanceof Error)) return String(error);
+	const details = [error.message];
+	let cause = error.cause;
+	while (cause && details.length < 4) {
+		const text = cause instanceof Error ? cause.message : String(cause);
+		if (text && !details.includes(text)) details.push(text);
+		cause = cause instanceof Error ? cause.cause : undefined;
+	}
+	return details.join(": ");
 }
 
 async function queryUsage(ctx: ExtensionContext, account: StoredAccount) {
@@ -366,13 +483,17 @@ async function queryUsage(ctx: ExtensionContext, account: StoredAccount) {
 		signal: AbortSignal.timeout(10_000),
 	});
 	if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-	const status = parseCodexUsageStatus(await response.json());
+	const status = parseCodexUsageStatus(await response.json(), Date.now());
 	if (!status) throw new Error("usage response has no recognized quota/spend fields");
 	return status;
 }
 
-export function queryCodexProviderUsage(ctx: ExtensionContext, providerId: string) {
-	return queryUsage(ctx, { label: providerId, providerId });
+export async function queryCodexProviderUsage(ctx: ExtensionContext, providerId: string) {
+	const account = loadAccounts().find((candidate) => candidate.providerId === providerId) ?? { label: providerId, providerId };
+	const usage = await queryUsage(ctx, account);
+	const snapshot = snapshotFor(account, usage);
+	if (snapshot) saveCodexUsageSnapshots([snapshot]);
+	return usage;
 }
 
 function publishProviderSync(provider: string, modelId: string, guard: CodexOperationGuard) {
@@ -440,36 +561,66 @@ function usageReport(results: UsageCheck[]) {
 	return results.map((result) => `${result.account.label}: ${hasUsage(result) ? result.usage.label : result.error}`).join("\n");
 }
 
-async function checkUsage(ctx: ExtensionContext, accounts: StoredAccount[], forceRefresh: boolean): Promise<UsageCheck[]> {
-	return Promise.all(accounts.map(async (account): Promise<UsageCheck> => {
+async function checkUsage(ctx: ExtensionContext, accounts: StoredAccount[]): Promise<UsageCheck[]> {
+	const results = await Promise.all(accounts.map(async (account): Promise<UsageCheck> => {
 		try {
-			if (forceRefresh) await forceRefreshOAuth(ctx, account);
 			return { account, usage: await queryUsage(ctx, account) };
 		} catch (error) {
-			return { account, error: error instanceof Error ? error.message : String(error) };
+			return { account, error: formatError(error) };
 		}
 	}));
+	const snapshots = results.flatMap((result) => {
+		if (!hasUsage(result)) return [];
+		const snapshot = snapshotFor(result.account, result.usage);
+		return snapshot ? [snapshot] : [];
+	});
+	if (snapshots.length) saveCodexUsageSnapshots(snapshots);
+	return results;
 }
 
 export async function queryCodexAccountUsage(
 	ctx: ExtensionContext,
-	forceRefresh = false,
+	options: { savedOnly?: boolean } = {},
 ): Promise<CodexAccountUsageEntry[]> {
+	const accounts = loadAccounts();
+	const history = loadCodexUsageHistory();
+	if (options.savedOnly) {
+		return accounts.map((account) => ({
+			label: account.label,
+			providerId: account.providerId,
+			saved: history.accounts[account.providerId],
+		}));
+	}
 	const configured = new Set((await modelRuntime(ctx).credentials.list()).map((item) => item.providerId));
-	const accounts = loadAccounts().filter((account) => configured.has(account.providerId));
-	const results = await checkUsage(ctx, accounts, forceRefresh);
-	return results.map((result) => ({
-		label: result.account.label,
-		providerId: result.account.providerId,
-		...(hasUsage(result) ? { usage: result.usage } : { error: result.error }),
-	}));
+	const loggedIn = accounts.filter((account) => configured.has(account.providerId));
+	const results = await checkUsage(ctx, loggedIn);
+	const byProvider = new Map(results.map((result) => [result.account.providerId, result]));
+	const updatedHistory = loadCodexUsageHistory();
+	return accounts.map((account) => {
+		const result = byProvider.get(account.providerId);
+		return {
+			label: account.label,
+			providerId: account.providerId,
+			...(result ? hasUsage(result) ? { usage: result.usage } : { error: result.error } : { error: "not logged in" }),
+			saved: updatedHistory.accounts[account.providerId],
+		};
+	});
 }
 
-export function formatCodexAccountUsage(entries: readonly CodexAccountUsageEntry[]) {
-	if (!entries.length) return "No logged-in Codex accounts found.";
-	return entries.map((entry) =>
-		`${entry.label}: ${entry.usage?.label ?? entry.error ?? "unknown"}`
-	).join("\n");
+function formatSnapshot(snapshot: CodexUsageSnapshot, now = Date.now()) {
+	const plan = snapshot.planType ? ` [${snapshot.planType}]` : "";
+	return `${snapshot.windows.map((window) => formatQuotaWindow(window, now)).join(" · ")}${plan}`;
+}
+
+export function formatCodexAccountUsage(entries: readonly CodexAccountUsageEntry[], now = Date.now()) {
+	if (!entries.length) return "No Codex accounts configured.";
+	return entries.map((entry) => {
+		if (entry.usage?.windows?.length) return `${entry.label}: ${formatSnapshot({ ...entry.usage, label: entry.label, providerId: entry.providerId }, now)}`;
+		const live = entry.usage?.label ?? entry.error ?? "saved only";
+		if (!entry.saved) return `${entry.label}: ${live}; no saved quota`;
+		const age = formatRemaining(now, entry.saved.observedAt);
+		return `${entry.label}: ${live}; saved ${age} ago: ${formatSnapshot(entry.saved, now)}`;
+	}).join("\n");
 }
 
 async function wait(milliseconds: number) {
@@ -487,7 +638,7 @@ async function autoSubscription(
 	if (!guardAllows(guard)) return selectionFailure("cancelled", "Codex account selection was cancelled.");
 	const configured = new Set((await modelRuntime(ctx).credentials.list()).map((item) => item.providerId));
 	let accounts = loadAccounts().filter((account) => configured.has(account.providerId));
-	if (!policy.postSeat && options.accountLabel) {
+	if (options.accountLabel) {
 		const account = findAccount(accounts, options.accountLabel);
 		if (!account) {
 			const message = `Logged-in Codex account "${options.accountLabel}" not found.`;
@@ -502,17 +653,15 @@ async function autoSubscription(
 		return selectionFailure("no-accounts", message);
 	}
 
-	const forceRefresh = policy.postSeat || options.forceRefresh === true;
-	const accountText = !policy.postSeat && options.accountLabel ? ` (${accounts[0].label})` : "";
-	const refreshText = forceRefresh ? " (refreshing OAuth tokens)" : "";
-	ctx.ui.notify(`Checking ${accounts.length} Codex subscriptions${accountText} for ${modelId}${refreshText}...`, "info");
+	const accountText = options.accountLabel ? ` (${accounts[0].label})` : "";
+	ctx.ui.notify(`Checking ${accounts.length} Codex subscriptions${accountText} for ${modelId}...`, "info");
 
 	const attempts = policy.postSeat ? POST_SEAT_USAGE_ATTEMPTS : 1;
 	let results: UsageCheck[] = [];
 	let usable: Extract<UsageCheck, { usage: CodexUsageStatus }>[] = [];
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		if (!guardAllows(guard)) return selectionFailure("cancelled", "Codex account selection was cancelled.");
-		results = await checkUsage(ctx, accounts, forceRefresh);
+		results = await checkUsage(ctx, accounts);
 		if (!guardAllows(guard)) return selectionFailure("cancelled", "Codex account selection was cancelled.");
 		usable = results.filter((result): result is Extract<UsageCheck, { usage: CodexUsageStatus }> =>
 			hasUsage(result) && result.usage.score > 0
@@ -612,8 +761,15 @@ export async function requestCodexAccountSelection(
 	context: ExtensionContext,
 	modelId: string,
 	guard: CodexOperationGuard,
+	accountLabel?: string,
 ): Promise<CodexSelectionResultV1> {
-	const request: CodexSelectionRequestV1 = { version: 1, context, modelId, guard };
+	const request: CodexSelectionRequestV1 = {
+		version: 1,
+		context,
+		modelId,
+		...(accountLabel ? { accountLabel } : {}),
+		guard,
+	};
 	pi.events.emit(CODEX_SELECTION_REQUEST_CHANNEL, request);
 	if (!request.run) {
 		return selectionFailure("selection-handler-unavailable", "The Codex account selection handler is unavailable.");
@@ -626,6 +782,23 @@ export async function requestCodexAccountSelection(
 			error instanceof Error ? error.message : String(error),
 		);
 	}
+}
+
+export function verifiedSeatChangeMessage(seat: Extract<CodexSeatRequestResultV1, { status: "succeeded" }>) {
+	if (seat.previousAccountLabel && seat.accountLabel) {
+		return `Seat changed successfully: ${seat.previousAccountLabel} → ${seat.accountLabel}.`;
+	}
+	if (seat.accountLabel) return `Seat changed successfully → ${seat.accountLabel}.`;
+	return "Seat changed successfully.";
+}
+
+export function verifiedSeatActivationFailureMessage(
+	seat: Extract<CodexSeatRequestResultV1, { status: "succeeded" }>,
+	modelId: string,
+	message: string,
+) {
+	const manual = seat.accountLabel ? ` Run /as ${seat.accountLabel} ${modelId} to select it manually.` : "";
+	return `${verifiedSeatChangeMessage(seat)} Local account activation failed: ${message.replace(/[.\s]+$/, "")}.${manual}`;
 }
 
 async function runAutoSubscription(
@@ -643,16 +816,18 @@ async function runAutoSubscription(
 		ctx.ui.notify(`ChatGPT seat change ${seat.status}: ${seat.message}`, seat.status === "failed" ? "error" : "warning");
 		return selectionFailure("seat-request-failed", seat.message);
 	}
+	ctx.ui.notify(verifiedSeatChangeMessage(seat), "info");
 	if (!guardAllows(guard)) return selectionFailure("cancelled", "Codex account selection was cancelled.");
 	const selection = await autoSubscription(
 		pi,
 		ctx,
 		modelId,
-		{ forceRefresh: true },
+		{ accountLabel: seat.accountLabel },
 		guard,
 		{ postSeat: true, suppressProviderSync: false },
 	);
 	if (selection.status === "selected") await recordSelectedProvider(pi, selection.provider);
+	else ctx.ui.notify(verifiedSeatActivationFailureMessage(seat, modelId, selection.message), "warning");
 	return selection;
 }
 
@@ -747,11 +922,13 @@ async function interactiveMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
 	if (choice === "Re-login account") return reloginAccount(ctx);
 }
 
-function parseAutoSubscriptionArgs(args: string) {
+export function forcedOAuthRefreshRequested(args: string) {
+	return args.trim().split(/\s+/).some((part) => part === "--refresh" || part === "-r");
+}
+
+export function parseAutoSubscriptionTokens(args: string, accountLabels: readonly string[]) {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
-	const accounts = loadAccounts();
 	let cycleSeat = false;
-	let forceRefresh = false;
 	let accountLabel: string | undefined;
 	const modelParts: string[] = [];
 	for (const part of parts) {
@@ -759,17 +936,22 @@ function parseAutoSubscriptionArgs(args: string) {
 			cycleSeat = true;
 			continue;
 		}
-		if (part === "--refresh" || part === "-r") {
-			forceRefresh = true;
-			continue;
-		}
-		if (forceRefresh && !accountLabel && findAccount(accounts, part)) {
-			accountLabel = part;
+		const canonicalLabel = accountLabels.find((label) => label.toLowerCase() === part.toLowerCase());
+		if (!accountLabel && canonicalLabel) {
+			accountLabel = canonicalLabel;
 			continue;
 		}
 		modelParts.push(part);
 	}
-	return { cycleSeat, modelId: modelParts.join(" ") || "gpt-5.6-sol", options: { forceRefresh, accountLabel } };
+	return {
+		cycleSeat,
+		modelId: modelParts.join(" ") || "gpt-5.6-sol",
+		options: { accountLabel },
+	};
+}
+
+function parseAutoSubscriptionArgs(args: string) {
+	return parseAutoSubscriptionTokens(args, loadAccounts().map((account) => account.label));
 }
 
 async function handleCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext) {
@@ -796,6 +978,9 @@ function isSelectionRequest(value: unknown): value is CodexSelectionRequestV1 {
 	const request = value as Partial<CodexSelectionRequestV1>;
 	return request.version === 1 &&
 		typeof request.modelId === "string" && !!request.modelId.trim() &&
+		(request.accountLabel === undefined || (
+			typeof request.accountLabel === "string" && !!request.accountLabel.trim()
+		)) &&
 		!!request.context && typeof request.context === "object" &&
 		typeof request.guard === "function";
 }
@@ -811,7 +996,7 @@ export default function codexAccountsExtension(pi: ExtensionAPI) {
 			pi,
 			value.context,
 			value.modelId.trim(),
-			{ forceRefresh: true },
+			{ accountLabel: value.accountLabel?.trim() },
 			value.guard,
 			{ postSeat: true, suppressProviderSync: true },
 		);
@@ -833,16 +1018,16 @@ export default function codexAccountsExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => handleCommand(pi, args, ctx),
 	});
 	pi.registerCommand("codex-usage", {
-		description: "Print live usage for every logged-in Codex account without selecting one",
+		description: "Show live or saved 5-hour and weekly Codex quota for every account",
 		handler: async (args, ctx) => {
 			const normalized = args.trim();
-			if (normalized && normalized !== "--refresh") {
-				ctx.ui.notify("Usage: /codex-usage [--refresh]", "warning");
+			if (normalized && normalized !== "--saved") {
+				ctx.ui.notify("Usage: /codex-usage [--saved]", "warning");
 				return;
 			}
 			ctx.ui.notify(
 				formatCodexAccountUsage(
-					await queryCodexAccountUsage(ctx, normalized === "--refresh"),
+					await queryCodexAccountUsage(ctx, { savedOnly: normalized === "--saved" }),
 				),
 				"info",
 			);
@@ -850,13 +1035,24 @@ export default function codexAccountsExtension(pi: ExtensionAPI) {
 	});
 
 	const autosubCommand = {
-		description: "Auto-select a logged-in Codex subscription with usage left and sync it across sessions. Usage: /as [--auto] [--refresh [account]] [model]",
+		description: "Select a Codex account or rotate its seat. Usage: /as [account] [model] | /as --auto [model]",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			if (codexAccountSelectionDisabled(pi)) {
 				ctx.ui.notify("Codex account selection is disabled while seat test mode is active.", "warning");
 				return;
 			}
+			if (forcedOAuthRefreshRequested(args)) {
+				ctx.ui.notify(
+					"Forced OAuth refresh is disabled. Tokens refresh automatically near expiry; use /as [account] [model] or /as --auto [model].",
+					"warning",
+				);
+				return;
+			}
 			const parsed = parseAutoSubscriptionArgs(args);
+			if (parsed.cycleSeat && parsed.options.accountLabel) {
+				ctx.ui.notify("Usage: /as [account] [model] | /as --auto [model]. Seat targets cannot be chosen by callers.", "warning");
+				return;
+			}
 			const generation = sessionGeneration;
 			const guard = () => sessionActive && generation === sessionGeneration;
 			await runAutoSubscription(pi, ctx, parsed.modelId, parsed.options, parsed.cycleSeat, guard);

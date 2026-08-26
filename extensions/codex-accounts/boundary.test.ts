@@ -5,10 +5,14 @@ import {
 	CODEX_SELECTION_REQUEST_CHANNEL,
 	codexAccountSelectionDisabled,
 	formatCodexAccountUsage,
+	forcedOAuthRefreshRequested,
 	hasUnambiguousPostSeatUsage,
+	parseAutoSubscriptionTokens,
 	parseCodexUsageStatus,
 	requestCodexAccountSelection,
 	requestCodexSeatChange,
+	verifiedSeatActivationFailureMessage,
+	verifiedSeatChangeMessage,
 	type CodexSeatRequestV1,
 	type CodexSelectionRequestV1,
 } from "./index.js";
@@ -73,27 +77,76 @@ describe("Codex account boundary", () => {
 		});
 		expect(keys).toEqual(["context", "guard", "modelId", "version"]);
 	});
+
+	test("recovery can request only the account verified by the seat server", async () => {
+		let accountLabel: string | undefined;
+		const events = {
+			emit(_channel: string, value: unknown) {
+				const request = value as CodexSelectionRequestV1;
+				accountLabel = request.accountLabel;
+				request.run = Promise.resolve({
+					version: 1,
+					status: "selected",
+					provider: "codex-account4",
+					modelId: request.modelId,
+					syncId: "sync-2",
+				});
+			},
+		};
+		await requestCodexAccountSelection({ events } as never, context, "gpt-5.6-sol", guard, "account4");
+		expect(accountLabel).toBe("account4");
+	});
+});
+
+describe("Codex command parsing", () => {
+	test("ordinary account selection targets exactly the requested label", () => {
+		expect(parseAutoSubscriptionTokens("ACCOUNT4 gpt-5.6-sol", ["account3", "account4"])).toEqual({
+			cycleSeat: false,
+			modelId: "gpt-5.6-sol",
+			options: { accountLabel: "account4" },
+		});
+	});
+
+	test("verified transition messages preserve both server-confirmed labels", () => {
+		const seat = {
+			version: 1 as const,
+			status: "succeeded" as const,
+			previousAccountLabel: "account3",
+			accountLabel: "account4",
+		};
+		expect(verifiedSeatChangeMessage(seat)).toBe("Seat changed successfully: account3 → account4.");
+		expect(verifiedSeatActivationFailureMessage(seat, "gpt-5.6-sol", "OAuth failed.")).toBe(
+			"Seat changed successfully: account3 → account4. Local account activation failed: OAuth failed. Run /as account4 gpt-5.6-sol to select it manually.",
+		);
+	});
+
+	test("legacy forced-refresh flags are rejected before argument parsing", () => {
+		expect(forcedOAuthRefreshRequested("--refresh account1 gpt-5.6-sol")).toBe(true);
+		expect(forcedOAuthRefreshRequested("-r account1 gpt-5.6-sol")).toBe(true);
+		expect(forcedOAuthRefreshRequested("--auto gpt-5.6-sol")).toBe(false);
+		expect(forcedOAuthRefreshRequested("gpt-5.6-sol")).toBe(false);
+	});
 });
 
 describe("Codex usage classification", () => {
 	test("hard quota signals override percentage fields", () => {
 		expect(parseCodexUsageStatus({
 			rate_limit: { limit_reached: true, primary_window: { used_percent: 20 } },
-		})).toEqual({ score: 0, label: "rate limit reached" });
+		})).toMatchObject({ score: 0, label: "rate limit reached" });
 	});
 
 	test("usage-based accounts remain excluded", () => {
 		expect(parseCodexUsageStatus({
 			spend_control: { reached: false },
 			credits: { overage_limit_reached: false },
-		})).toEqual({ score: -1, label: "usage-based/skipped" });
+		})).toMatchObject({ score: -1, label: "usage-based/skipped", windows: [] });
 	});
 
 	test("usage reports preserve account labels without selecting a provider", () => {
 		expect(formatCodexAccountUsage([
 			{ label: "Y Ananas", providerId: "codex-y-ananas", usage: { score: 80, label: "80% left" } },
 			{ label: "X Banan", providerId: "codex-x-banan", usage: { score: -1, label: "usage-based/skipped" } },
-		])).toBe("Y Ananas: 80% left\nX Banan: usage-based/skipped");
+		])).toBe("Y Ananas: 80% left; no saved quota\nX Banan: usage-based/skipped; no saved quota");
 	});
 
 	test("post-seat state requires one usable account and no unknown observations", () => {
