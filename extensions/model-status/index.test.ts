@@ -89,7 +89,7 @@ test("status refresh is background-only and shared usage/reset data is throttled
 	const footer = footerFactory({ requestRender() {} });
 	assert.doesNotMatch(footer.render(120)[0], /a:/);
 	context.model.provider = "codex-pi19";
-	assert.match(footer.render(120)[0], /gpt-5\.6-solh a:19 c:1\.0k/);
+	assert.match(footer.render(120)[0], /gpt-5\.6-sol[lmhxMn] a:19 c:1\.0k/);
 	context.model.provider = "codex-pro";
 	assert.match(footer.render(120)[0], /u:92% r:5d/);
 	await commands.get("usage").handler("off", context);

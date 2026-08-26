@@ -282,6 +282,12 @@ function runnerCode(result: VerifiedWebhookResult) {
 		: undefined;
 }
 
+function validRunnerAccountLabel(value: unknown): value is string {
+	return typeof value === "string" &&
+		value.length <= 64 &&
+		/^[A-Za-z0-9](?:[A-Za-z0-9._-]| [A-Za-z0-9._-])*$/.test(value);
+}
+
 function verifiedRunnerTransition(result: VerifiedWebhookResult) {
 	const runner = result.job?.result?.data.runner;
 	if (!isRecord(runner) || runner.version === 1) return undefined;
@@ -299,10 +305,8 @@ function verifiedRunnerTransition(result: VerifiedWebhookResult) {
 		runner.ok !== true ||
 		runner.uncertain !== false ||
 		(runner.code !== "success" && runner.code !== "success_reconciled") ||
-		typeof runner.previous_account !== "string" ||
-		!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(runner.previous_account) ||
-		typeof runner.selected_account !== "string" ||
-		!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(runner.selected_account) ||
+		!validRunnerAccountLabel(runner.previous_account) ||
+		!validRunnerAccountLabel(runner.selected_account) ||
 		runner.previous_account === runner.selected_account
 	) {
 		throw new Error("The signed Mac response contains an invalid verified seat transition.");

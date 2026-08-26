@@ -153,16 +153,16 @@ test("verified runner v2 success returns the exact account transition", async ()
 			code: "success",
 			uncertain: false,
 			pool: "team-a",
-			previous_account: "account3",
-			selected_account: "account4",
+			previous_account: "Account One",
+			selected_account: "Account Two",
 		}),
 	});
 	const result = await executeSeatRequestV1({ version: 1, context, guard: () => true }, fake.values);
 	expect(result).toEqual({
 		version: 1,
 		status: "succeeded",
-		previousAccountLabel: "account3",
-		accountLabel: "account4",
+		previousAccountLabel: "Account One",
+		accountLabel: "Account Two",
 	});
 	expect(fake.pending).toBeUndefined();
 });
