@@ -1,0 +1,103 @@
+#!/bin/sh
+set -eu
+
+agent_dir=${PI_AGENT_DIR:-$HOME/.pi/agent}
+root_file=${PI_CODEX_RUNTIME_ROOT_FILE:-$agent_dir/codex-runtime-compat/root}
+root=${PI_CODING_AGENT_ROOT:-}
+if [ -z "$root" ]; then
+	[ -r "$root_file" ] || {
+		printf '%s\n' "Missing Codex runtime root file: $root_file" >&2
+		exit 1
+	}
+	root=$(cat "$root_file")
+fi
+
+case $root in
+	/*) ;;
+	*) printf '%s\n' 'Pi coding-agent root must be absolute.' >&2; exit 1 ;;
+esac
+
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+agent_session=$root/dist/core/agent-session.js
+extension_loader=$root/dist/core/extensions/loader.js
+extension_types=$root/dist/core/extensions/types.d.ts
+codex_responses=$root/node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js
+ai_types=$root/node_modules/@earendil-works/pi-ai/dist/types.d.ts
+simple_options=$root/node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+
+for file in "$agent_session" "$extension_loader" "$extension_types" "$codex_responses" "$ai_types" "$simple_options"; do
+	[ -f "$file" ] || {
+		printf 'Missing Pi runtime file: %s\n' "$file" >&2
+		exit 1
+	}
+done
+
+has_marker() {
+	grep -Fq "$2" "$1" 2>/dev/null
+}
+
+has_marker_count() {
+	count=$(grep -Foc "$2" "$1" 2>/dev/null || true)
+	[ "${count:-0}" -eq "$3" ]
+}
+
+awaited_send_present() {
+	has_marker "$agent_session" 'Return the run promise so recovery can keep one-shot sessions alive.' \
+		&& has_marker "$extension_loader" 'Preserve the runtime promise for one-shot continuation recovery.' \
+		&& has_marker "$extension_types" 'Send a custom message and resolve after any triggered agent run settles.' \
+		&& has_marker "$extension_types" 'Returns when a triggered agent run settles; callers may continue to ignore the promise.'
+}
+
+codex_affinity_present() {
+	if has_marker "$codex_responses" 'const cacheSessionId = clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId);' \
+		&& has_marker "$codex_responses" 'const websocketRequestId = cacheSessionId || uuidv7();' \
+		&& has_marker "$codex_responses" 'buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, cacheSessionId);' \
+		&& has_marker "$codex_responses" 'buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);' \
+		&& has_marker "$codex_responses" 'prompt_cache_key: clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId),'; then
+		return 0
+	fi
+	has_marker "$codex_responses" 'const transportSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;' \
+		&& has_marker "$codex_responses" 'const cacheSessionId = options?.cacheRetention === "none" ? undefined : (options?.cacheSessionId ?? options?.sessionId);' \
+		&& has_marker "$codex_responses" 'const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);' \
+		&& has_marker "$codex_responses" 'buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties);' \
+		&& has_marker "$codex_responses" 'buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);' \
+		&& has_marker "$codex_responses" 'buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);' \
+		&& has_marker "$codex_responses" 'isWebSocketSseFallbackActive(transportSessionId)' \
+		&& has_marker_count "$codex_responses" 'recordWebSocketSseFallback(transportSessionId);' 2 \
+		&& has_marker "$codex_responses" 'websocketConnectTimeoutMs, transportSessionId,' \
+		&& has_marker "$codex_responses" 'async function processWebSocketStream(url, body, headers, output, stream, model, onStart, idleTimeoutMs, websocketConnectTimeoutMs, transportSessionId,' \
+		&& has_marker "$codex_responses" 'recordWebSocketFailure(transportSessionId, error);' \
+		&& has_marker "$codex_responses" 'acquireWebSocket(url, headers, transportSessionId,' \
+		&& has_marker "$codex_responses" 'getOrCreateWebSocketDebugStats(transportSessionId)' \
+		&& has_marker "$codex_responses" 'prompt_cache_key: cacheSessionId,'
+}
+
+patches_present() {
+	awaited_send_present \
+		&& codex_affinity_present \
+		&& has_marker "$ai_types" 'cacheSessionId?: string;' \
+		&& has_marker "$simple_options" 'cacheSessionId: options?.cacheSessionId'
+}
+
+if patches_present; then
+	exit 0
+fi
+
+log=$(mktemp "${TMPDIR:-/tmp}/pi-codex-runtime-patches.XXXXXX")
+trap 'rm -f "$log"' EXIT HUP INT TERM
+
+export PI_CODING_AGENT_ROOT=$root
+export PI_CODEX_RESPONSES_PATH=$codex_responses
+export PI_AI_TYPES_PATH=$ai_types
+export PI_SIMPLE_OPTIONS_PATH=$simple_options
+
+if ! {
+	"$bin_dir/pi-patch-awaited-extension-send-message" \
+		&& "$bin_dir/pi-patch-codex-cache-affinity"
+} >"$log" 2>&1 || ! patches_present; then
+	cat "$log" >&2
+	printf '%s\n' 'Codex runtime patches are incompatible with this Pi release; refusing to start unpatched.' >&2
+	exit 1
+fi
+
+printf '%s\n' 'Restored Codex runtime compatibility patches.' >&2

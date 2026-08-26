@@ -6,6 +6,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$repo/scripts/public-files.txt"
 staging="$repo/.sync-staging.$$"
 extensions_backup="$repo/.extensions-pre-sync.$$"
+portable_backup="$repo/.portable-pre-sync.$$"
 prompts_backup="$repo/.prompts-pre-sync.$$"
 
 approved_extensions=(
@@ -51,6 +52,9 @@ cleanup() {
   rm -rf "$staging"
   if [[ -d "$extensions_backup" && ! -d "$repo/extensions" ]]; then
     mv "$extensions_backup" "$repo/extensions"
+  fi
+  if [[ -d "$portable_backup" && ! -d "$repo/portable" ]]; then
+    mv "$portable_backup" "$repo/portable"
   fi
   if [[ -d "$prompts_backup" && ! -d "$repo/prompts" ]]; then
     mv "$prompts_backup" "$repo/prompts"
@@ -103,7 +107,25 @@ for extension in "${approved_extensions[@]}"; do
   done < <(find "$source_dir" -path "$source_dir/node_modules" -prune -o -type f -print0)
 done
 
-mkdir -p "$staging/extensions" "$staging/prompts"
+portable_source="$src/portable/codex-runtime-compat"
+if [[ ! -d "$portable_source" || -L "$portable_source" ]]; then
+  printf 'Missing regular portable runtime source: %s\n' "$portable_source" >&2
+  exit 1
+fi
+symlink="$(find "$portable_source" -type l -print -quit)"
+if [[ -n "$symlink" ]]; then
+  printf 'Refusing symlink in portable runtime source: %s\n' "$symlink" >&2
+  exit 1
+fi
+while IFS= read -r -d '' file; do
+  relative="${file#"$src"/}"
+  if ! is_allowlisted "$relative"; then
+    printf 'Refusing portable file absent from publication manifest: %s\n' "$relative" >&2
+    exit 1
+  fi
+done < <(find "$portable_source" -type f -print0)
+
+mkdir -p "$staging/extensions" "$staging/portable" "$staging/prompts"
 while IFS= read -r relative; do
   [[ -n "$relative" ]] || continue
   case "$relative" in
@@ -116,6 +138,8 @@ while IFS= read -r relative; do
         printf 'Unapproved extension in publication manifest: %s\n' "$relative" >&2
         exit 1
       fi
+      ;;
+    portable/codex-runtime-compat/*)
       ;;
     *)
       printf 'Invalid path in publication manifest: %s\n' "$relative" >&2
@@ -152,6 +176,12 @@ fi
 mv "$repo/extensions" "$extensions_backup"
 mv "$staging/extensions" "$repo/extensions"
 rm -rf "$extensions_backup"
+
+if [[ -d "$repo/portable" ]]; then
+  mv "$repo/portable" "$portable_backup"
+fi
+mv "$staging/portable" "$repo/portable"
+rm -rf "$portable_backup"
 
 if [[ -d "$repo/prompts" ]]; then
   mv "$repo/prompts" "$prompts_backup"

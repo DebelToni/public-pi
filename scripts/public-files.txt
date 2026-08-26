@@ -125,4 +125,11 @@ extensions/zz-prompt-tabs/tabbed-editor.test.ts
 extensions/zz-prompt-tabs/tabbed-editor.ts
 extensions/zzz-close-on-done/index.test.ts
 extensions/zzz-close-on-done/index.ts
+portable/codex-runtime-compat/README.md
+portable/codex-runtime-compat/install.sh
+portable/codex-runtime-compat/pi
+portable/codex-runtime-compat/pi-ensure-codex-runtime-patches
+portable/codex-runtime-compat/pi-patch-awaited-extension-send-message
+portable/codex-runtime-compat/pi-patch-codex-cache-affinity
+portable/codex-runtime-compat/test_pi_awaited_extension_send_message.mjs
 prompts/friend-codex-automatic-switching.md

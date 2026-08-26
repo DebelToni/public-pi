@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+agent_dir=${PI_AGENT_DIR:-$HOME/.pi/agent}
+root_file=${PI_CODEX_RUNTIME_ROOT_FILE:-$agent_dir/codex-runtime-compat/root}
+[ -r "$root_file" ] || {
+	printf '%s\n' "Missing Codex runtime root file: $root_file" >&2
+	exit 1
+}
+root=$(cat "$root_file")
+case $root in
+	/*) ;;
+	*) printf '%s\n' 'Pi coding-agent root must be absolute.' >&2; exit 1 ;;
+esac
+
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export PI_CODING_AGENT_ROOT=$root
+if [ "${PI_SKIP_CODEX_RUNTIME_PATCH_CHECK:-0}" != 1 ]; then
+	"$bin_dir/pi-ensure-codex-runtime-patches"
+fi
+
+real_bin=${PI_REAL_BIN:-$root/dist/cli.js}
+[ -x "$real_bin" ] || {
+	printf 'Pi modular CLI is unavailable: %s\n' "$real_bin" >&2
+	exit 1
+}
+exec "$real_bin" "$@"

@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Separate Codex prompt-cache affinity from WebSocket connection pooling."""
+
+from pathlib import Path
+import os
+
+target_value = os.environ.get("PI_CODEX_RESPONSES_PATH")
+if not target_value:
+    raise RuntimeError("PI_CODEX_RESPONSES_PATH is required")
+TARGET = Path(target_value)
+TYPES_TARGET = Path(os.environ.get(
+    "PI_AI_TYPES_PATH",
+    str(TARGET.parents[1] / "types.d.ts"),
+))
+SIMPLE_OPTIONS_TARGET = Path(os.environ.get(
+    "PI_SIMPLE_OPTIONS_PATH",
+    str(TARGET.with_name("simple-options.js")),
+))
+text = TARGET.read_text("utf8")
+types_text = TYPES_TARGET.read_text("utf8")
+simple_options_text = SIMPLE_OPTIONS_TARGET.read_text("utf8")
+types_marker = "cacheSessionId?: string;"
+simple_options_marker = "cacheSessionId: options?.cacheSessionId"
+modern_request_markers = (
+    '''            const transportSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;''',
+    '''            const cacheSessionId = options?.cacheRetention === "none" ? undefined : (options?.cacheSessionId ?? options?.sessionId);''',
+    '''            const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);''',
+    '''            let body = buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties);''',
+    '''            const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);''',
+    '''            const websocketHeaders = buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);''',
+    '''isWebSocketSseFallbackActive(transportSessionId)''',
+    '''}, httpTimeoutMs, websocketConnectTimeoutMs, transportSessionId,''',
+    '''recordWebSocketFailure(transportSessionId, error);''',
+    '''        prompt_cache_key: cacheSessionId,''',
+    '''async function processWebSocketStream(url, body, headers, output, stream, model, onStart, idleTimeoutMs, websocketConnectTimeoutMs, transportSessionId,''',
+    '''acquireWebSocket(url, headers, transportSessionId,''',
+    '''getOrCreateWebSocketDebugStats(transportSessionId)''',
+)
+legacy_request_markers = (
+    '''            const cacheSessionId = clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId);''',
+    '''            const websocketRequestId = cacheSessionId || uuidv7();''',
+    '''            const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, cacheSessionId);''',
+    '''            const websocketHeaders = buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);''',
+    '''        prompt_cache_key: clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId),''',
+)
+
+
+def modern_request_patched() -> bool:
+    return (
+        all(value in text for value in modern_request_markers)
+        and text.count("recordWebSocketSseFallback(transportSessionId);") == 2
+    )
+
+
+def legacy_request_patched() -> bool:
+    return all(value in text for value in legacy_request_markers)
+
+
+if (modern_request_patched() or legacy_request_patched()) and types_marker in types_text and simple_options_marker in simple_options_text:
+    print("Codex cache-affinity patch already present")
+    raise SystemExit(0)
+
+legacy_replacements = [
+    (
+        "request routing affinity",
+        '''            const codexSessionId = clampOpenAIPromptCacheKey(options?.sessionId);
+            const websocketRequestId = codexSessionId || uuidv7();
+            const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
+            const websocketHeaders = buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);
+''',
+        '''            // A cache fork may need the parent's routing affinity while retaining a
+            // separate sessionId for its own reusable WebSocket connection.
+            const cacheSessionId = clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId);
+            const websocketRequestId = cacheSessionId || uuidv7();
+            const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, cacheSessionId);
+            const websocketHeaders = buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);
+''',
+    ),
+    (
+        "request body cache key",
+        '''        prompt_cache_key: clampOpenAIPromptCacheKey(options?.sessionId),
+''',
+        '''        prompt_cache_key: clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId),
+''',
+    ),
+]
+modern_replacements = [
+    (
+        "cache and transport session identities",
+        '''            const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
+''',
+        '''            // A cache fork may retain the parent's routing affinity while using a
+            // dedicated reusable WebSocket identified by its own sessionId.
+            const transportSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
+            const cacheSessionId = options?.cacheRetention === "none" ? undefined : (options?.cacheSessionId ?? options?.sessionId);
+''',
+    ),
+    (
+        "WebSocket fallback identity",
+        '''            const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);
+            if (websocketDisabledForSession) {
+                recordWebSocketSseFallback(cacheSessionId);
+            }
+''',
+        '''            const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(transportSessionId);
+            if (websocketDisabledForSession) {
+                recordWebSocketSseFallback(transportSessionId);
+            }
+''',
+    ),
+    (
+        "WebSocket failure identity",
+        '''                        recordWebSocketFailure(cacheSessionId, error);
+                        if (websocketStarted) {
+                            throw error;
+                        }
+                        recordWebSocketSseFallback(cacheSessionId);
+''',
+        '''                        recordWebSocketFailure(transportSessionId, error);
+                        if (websocketStarted) {
+                            throw error;
+                        }
+                        recordWebSocketSseFallback(transportSessionId);
+''',
+    ),
+    (
+        "WebSocket debug identity",
+        '''    const stats = cacheSessionId ? getOrCreateWebSocketDebugStats(cacheSessionId) : undefined;
+''',
+        '''    const stats = transportSessionId ? getOrCreateWebSocketDebugStats(transportSessionId) : undefined;
+''',
+    ),
+]
+modern_websocket_replacements = [
+    (
+        "WebSocket pool identity",
+        '''}, httpTimeoutMs, websocketConnectTimeoutMs, cacheSessionId, grammarToolInputProperties, options);
+''',
+        '''}, httpTimeoutMs, websocketConnectTimeoutMs, transportSessionId, grammarToolInputProperties, options);
+''',
+    ),
+    (
+        "WebSocket stream transport parameter",
+        '''async function processWebSocketStream(url, body, headers, output, stream, model, onStart, idleTimeoutMs, websocketConnectTimeoutMs, cacheSessionId, grammarToolInputProperties, options) {
+    const { socket, entry, reused, release } = await acquireWebSocket(url, headers, cacheSessionId, options?.signal, websocketConnectTimeoutMs, options?.env);
+''',
+        '''async function processWebSocketStream(url, body, headers, output, stream, model, onStart, idleTimeoutMs, websocketConnectTimeoutMs, transportSessionId, grammarToolInputProperties, options) {
+    const { socket, entry, reused, release } = await acquireWebSocket(url, headers, transportSessionId, options?.signal, websocketConnectTimeoutMs, options?.env);
+''',
+    ),
+]
+account_scoped_websocket_replacements = [
+    (
+        "WebSocket pool identity",
+        '''}, httpTimeoutMs, websocketConnectTimeoutMs, cacheSessionId, accountId, grammarToolInputProperties, options);
+''',
+        '''}, httpTimeoutMs, websocketConnectTimeoutMs, transportSessionId, accountId, grammarToolInputProperties, options);
+''',
+    ),
+    (
+        "WebSocket stream transport parameter",
+        '''async function processWebSocketStream(url, body, headers, output, stream, model, onStart, idleTimeoutMs, websocketConnectTimeoutMs, cacheSessionId, accountId, grammarToolInputProperties, options) {
+    const { socket, entry, reused, release } = await acquireWebSocket(url, headers, cacheSessionId, accountId, options?.signal, websocketConnectTimeoutMs, options?.env);
+''',
+        '''async function processWebSocketStream(url, body, headers, output, stream, model, onStart, idleTimeoutMs, websocketConnectTimeoutMs, transportSessionId, accountId, grammarToolInputProperties, options) {
+    const { socket, entry, reused, release } = await acquireWebSocket(url, headers, transportSessionId, accountId, options?.signal, websocketConnectTimeoutMs, options?.env);
+''',
+    ),
+]
+
+if modern_request_patched() or legacy_request_patched():
+    print("skip Codex request routing: already patched")
+elif '''const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;''' in text:
+    websocket_replacements = (
+        account_scoped_websocket_replacements
+        if '''websocketConnectTimeoutMs, cacheSessionId, accountId, grammarToolInputProperties, options);''' in text
+        else modern_websocket_replacements
+    )
+    for label, old, new in [*modern_replacements, *websocket_replacements]:
+        count = text.count(old)
+        if count != 1:
+            raise RuntimeError(f"{label}: expected one match in {TARGET}, found {count}")
+        text = text.replace(old, new)
+        print(f"patched {label}")
+    if not modern_request_patched():
+        raise RuntimeError("modern Codex cache-affinity markers missing after patch")
+else:
+    for label, old, new in legacy_replacements:
+        count = text.count(old)
+        if count != 1:
+            raise RuntimeError(f"{label}: expected one match in {TARGET}, found {count}")
+        text = text.replace(old, new)
+        print(f"patched {label}")
+    if not legacy_request_patched():
+        raise RuntimeError("legacy Codex cache-affinity markers missing after patch")
+
+if simple_options_marker not in simple_options_text:
+    old_simple_options = '''        sessionId: options?.sessionId,
+        headers: options?.headers,
+'''
+    new_simple_options = '''        sessionId: options?.sessionId,
+        cacheSessionId: options?.cacheSessionId,
+        headers: options?.headers,
+'''
+    count = simple_options_text.count(old_simple_options)
+    if count != 1:
+        raise RuntimeError(f"simple stream options: expected one match in {SIMPLE_OPTIONS_TARGET}, found {count}")
+    simple_options_text = simple_options_text.replace(old_simple_options, new_simple_options)
+    print("patched simple stream option forwarding")
+
+if types_marker not in types_text:
+    old_types = '''    sessionId?: string;
+'''
+    new_types = '''    sessionId?: string;
+    /**
+     * Optional prompt-cache and request-routing affinity distinct from sessionId.
+     * Providers that support it retain sessionId for transport connection pooling.
+     */
+    cacheSessionId?: string;
+'''
+    count = types_text.count(old_types)
+    if count != 1:
+        raise RuntimeError(f"stream option type: expected one match in {TYPES_TARGET}, found {count}")
+    types_text = types_text.replace(old_types, new_types)
+    print("patched stream option type")
+
+TARGET.write_text(text, "utf8")
+TYPES_TARGET.write_text(types_text, "utf8")
+SIMPLE_OPTIONS_TARGET.write_text(simple_options_text, "utf8")
+print(f"wrote {TARGET}")
+print(f"wrote {TYPES_TARGET}")
+print(f"wrote {SIMPLE_OPTIONS_TARGET}")
+print("Codex cache-affinity patch applied; restart Pi to load it")
