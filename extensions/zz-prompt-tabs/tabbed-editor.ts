@@ -6,6 +6,7 @@ import {
 	type EditorTheme,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import type { ClosedPromptTab } from "./durable-state.ts";
 
 type Draft = {
 	editor: CustomEditor;
@@ -18,7 +19,9 @@ type TabbedEditorOptions = {
 	isIdle: () => boolean;
 	recall: (actualQueuedText: string) => string[];
 	onFooterChange: (text: string | undefined) => void;
-	onStateChange: (snapshot: DraftTabsSnapshot) => void;
+	onStateChange: (snapshot: DraftTabsSnapshot, closedTabs: ClosedPromptTab[]) => void;
+	commitCriticalState: (snapshot: DraftTabsSnapshot, closedTabs: ClosedPromptTab[]) => boolean;
+	initialClosedTabs?: ClosedPromptTab[];
 	onSubmitError: (error: unknown) => void;
 };
 
@@ -50,6 +53,7 @@ function draftSummary(text: string) {
 export class TabbedEditor extends CustomEditor {
 	private drafts: Draft[] = [];
 	private activeIndex = 0;
+	private closedTabs: ClosedPromptTab[];
 	private sharedHistory: string[] = [];
 	private autocomplete?: AutocompleteProvider;
 	private editorPaddingX = 0;
@@ -59,6 +63,7 @@ export class TabbedEditor extends CustomEditor {
 	private mutationDepth = 0;
 	private mutationSnapshot?: DraftTabsSnapshot;
 	private stateDirty = false;
+	private suppressAppClearTextReset = false;
 	private readonly submissionContext = new AsyncLocalStorage<Draft>();
 	private readonly appKeybindings: KeybindingsManager;
 	private readonly options: TabbedEditorOptions;
@@ -67,6 +72,7 @@ export class TabbedEditor extends CustomEditor {
 		super(tui, editorTheme, appKeybindings);
 		this.appKeybindings = appKeybindings;
 		this.options = options;
+		this.closedTabs = structuredClone(options.initialClosedTabs ?? []);
 		this.mutationDepth = 1;
 		this.createDraft("");
 		this.mutationDepth = 0;
@@ -86,7 +92,7 @@ export class TabbedEditor extends CustomEditor {
 			this.stateDirty = true;
 			return;
 		}
-		this.options.onStateChange(this.getSnapshot());
+		this.options.onStateChange(this.getSnapshot(), this.getClosedTabs());
 	}
 
 	private runMutation<T>(callback: () => T, rollback?: DraftTabsSnapshot): T {
@@ -108,7 +114,7 @@ export class TabbedEditor extends CustomEditor {
 				const publish = completed && this.stateDirty;
 				this.stateDirty = false;
 				this.mutationSnapshot = previousSnapshot;
-				if (publish) this.options.onStateChange(this.getSnapshot());
+				if (publish) this.options.onStateChange(this.getSnapshot(), this.getClosedTabs());
 			}
 		}
 	}
@@ -172,9 +178,9 @@ export class TabbedEditor extends CustomEditor {
 		const currentText = draft.editor.getExpandedText();
 		const originalText = this.mutationSnapshot?.texts[index] ?? (currentText || text);
 		// Pi's editor callback is fire-and-forget: a non-throwing invocation is the
-		// acceptance boundary. Keep the existing immediate pop for async handlers.
+		// acceptance boundary. Replace the submitted draft immediately for async handlers.
 		const result = this.submissionContext.run(draft, submit);
-		const replacement = this.popDraft(draft);
+		const replacement = this.replaceSubmittedDraft(draft);
 		const replacementRevision = replacement?.revision;
 		if (isPromiseLike(result)) {
 			void Promise.resolve(result).catch((error) => {
@@ -221,15 +227,30 @@ export class TabbedEditor extends CustomEditor {
 		});
 	}
 
+	private replaceSubmittedDraft(draft: Draft) {
+		const index = this.drafts.indexOf(draft);
+		if (index < 0) return undefined;
+		draft.editor.focused = false;
+		const replacement = this.createDraft("");
+		this.drafts.pop();
+		this.drafts[index] = replacement;
+		this.activeIndex = index;
+		this.syncActiveEditor();
+		this.onChange?.(this.getText());
+		this.publishFooter();
+		this.stateChanged();
+		this.tui.requestRender();
+		return replacement;
+	}
+
 	private popDraft(draft: Draft) {
 		const index = this.drafts.indexOf(draft);
 		if (index < 0) return undefined;
-		let replacement: Draft | undefined;
 		if (this.drafts.length === 1) {
 			draft.editor.focused = false;
 			this.drafts = [];
 			this.activeIndex = 0;
-			replacement = this.createDraft("");
+			this.createDraft("");
 		} else {
 			draft.editor.focused = false;
 			const wasActive = index === this.activeIndex;
@@ -242,7 +263,7 @@ export class TabbedEditor extends CustomEditor {
 		this.publishFooter();
 		this.stateChanged();
 		this.tui.requestRender();
-		return replacement;
+		return undefined;
 	}
 
 	private footerText() {
@@ -293,8 +314,57 @@ export class TabbedEditor extends CustomEditor {
 		this.runMutation(() => this.activate((this.activeIndex + 1) % this.drafts.length));
 	}
 
+	selectDraft(index: number) {
+		this.runMutation(() => this.activate(index));
+	}
+
 	closeCurrentDraft() {
+		const index = this.activeIndex;
+		const text = this.activeDraft().editor.getExpandedText();
+		if (!text.trim()) {
+			this.runMutation(() => this.popDraft(this.activeDraft()));
+			return true;
+		}
+		const closedTabs = [...this.closedTabs, {
+			text,
+			closedAt: Date.now(),
+			index,
+			wasOnlyTab: this.drafts.length === 1,
+		}];
+		const texts = this.getSnapshot().texts;
+		let snapshot: DraftTabsSnapshot;
+		if (texts.length === 1) {
+			snapshot = { texts: [""], activeIndex: 0 };
+		} else {
+			texts.splice(index, 1);
+			snapshot = { texts, activeIndex: Math.min(index, texts.length - 1) };
+		}
+		if (!this.options.commitCriticalState(snapshot, closedTabs)) return false;
+		this.closedTabs = closedTabs;
 		this.runMutation(() => this.popDraft(this.activeDraft()));
+		return true;
+	}
+
+	restoreClosedDraft() {
+		const closed = this.closedTabs.at(-1);
+		if (!closed) return false;
+		const closedTabs = this.closedTabs.slice(0, -1);
+		const current = this.getSnapshot();
+		const replaceEmptyPlaceholder = closed.wasOnlyTab
+			&& current.texts.length === 1
+			&& !current.texts[0]!.trim();
+		let snapshot: DraftTabsSnapshot;
+		if (replaceEmptyPlaceholder) {
+			snapshot = { texts: [closed.text], activeIndex: 0 };
+		} else {
+			const index = Math.min(closed.index, current.texts.length);
+			current.texts.splice(index, 0, closed.text);
+			snapshot = { texts: current.texts, activeIndex: index };
+		}
+		if (!this.options.commitCriticalState(snapshot, closedTabs)) return false;
+		this.closedTabs = closedTabs;
+		this.runMutation(() => this.replaceSnapshot(snapshot, false));
+		return true;
 	}
 
 	submitCurrentDraft() {
@@ -325,6 +395,10 @@ export class TabbedEditor extends CustomEditor {
 
 	getActiveIndex() {
 		return this.activeIndex;
+	}
+
+	getClosedTabs() {
+		return structuredClone(this.closedTabs);
 	}
 
 	getSnapshot(): DraftTabsSnapshot {
@@ -388,6 +462,19 @@ export class TabbedEditor extends CustomEditor {
 	}
 
 	private handleInputMutation(data: string) {
+		if (this.appKeybindings.matches(data, "app.clear")) {
+			// Pi's first app.clear invocation arms its double-press exit timer and
+			// synchronously clears the editor. Keep the timer behavior while refusing
+			// that reset so a second press can quit without destroying the draft.
+			this.suppressAppClearTextReset = true;
+			try {
+				this.syncActiveEditor();
+				this.activeDraft().editor.handleInput(data);
+			} finally {
+				this.suppressAppClearTextReset = false;
+			}
+			return;
+		}
 		// Legacy terminals encode Option+[ and Option+] as bare ESC-prefixed
 		// punctuation, which Pi cannot represent through registerShortcut.
 		if (data === "\x1b[") {
@@ -396,6 +483,12 @@ export class TabbedEditor extends CustomEditor {
 		}
 		if (data === "\x1b]") {
 			this.nextDraft();
+			return;
+		}
+		// With tmux extended keys disabled, Option+Shift+T arrives as ESC T
+		// instead of a distinguishable modified-key event.
+		if (data === "\x1bT") {
+			this.restoreClosedDraft();
 			return;
 		}
 		if (this.appKeybindings.matches(data, "app.interrupt") && !this.activeDraft().editor.isShowingAutocomplete() && !this.options.isIdle()) {
@@ -445,6 +538,10 @@ export class TabbedEditor extends CustomEditor {
 	}
 
 	override setText(text: string): void {
+		if (this.suppressAppClearTextReset && text === "") {
+			this.suppressAppClearTextReset = false;
+			return;
+		}
 		if (this.ignoreNextTransferredText) {
 			this.ignoreNextTransferredText = false;
 			return;
@@ -454,6 +551,7 @@ export class TabbedEditor extends CustomEditor {
 			return;
 		}
 		this.targetDraft().editor.setText(text);
+		this.tui.requestRender();
 	}
 
 	override insertTextAtCursor(text: string): void {

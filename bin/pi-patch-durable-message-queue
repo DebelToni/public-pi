@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""Patch Pi so queued steering and follow-up messages survive process crashes."""
+
+from pathlib import Path
+import os
+import stat
+import subprocess
+import tempfile
+import uuid
+
+CODING_AGENT_ROOT = Path(os.environ.get(
+    "PI_CODING_AGENT_ROOT",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent",
+))
+AGENT_CORE_ROOT = CODING_AGENT_ROOT / "node_modules/@earendil-works/pi-agent-core"
+TARGETS = {
+    "agent session": CODING_AGENT_ROOT / "dist/core/agent-session.js",
+    "session manager": CODING_AGENT_ROOT / "dist/core/session-manager.js",
+    "session manager types": CODING_AGENT_ROOT / "dist/core/session-manager.d.ts",
+    "agent core": AGENT_CORE_ROOT / "dist/agent.js",
+    "agent core types": AGENT_CORE_ROOT / "dist/agent.d.ts",
+}
+HELPER_SOURCE = Path(__file__).resolve().parent.parent / "core-patches/durable-message-queue.js"
+HELPER_TARGET = CODING_AGENT_ROOT / "dist/core/durable-message-queue.js"
+PROPER_LOCKFILE = CODING_AGENT_ROOT / "node_modules/proper-lockfile/index.js"
+
+if not PROPER_LOCKFILE.is_file():
+    raise RuntimeError(f"Pi's proper-lockfile dependency is unavailable: {PROPER_LOCKFILE}")
+texts = {name: path.read_text("utf8") for name, path in TARGETS.items()}
+changed: set[str] = set()
+
+
+def replace_once(target: str, label: str, old: str, new: str, marker: str) -> None:
+    replace_once_variant(target, label, ((old, new),), marker)
+
+
+def replace_once_variant(
+    target: str,
+    label: str,
+    variants: tuple[tuple[str, str], ...],
+    marker: str,
+) -> None:
+    text = texts[target]
+    if marker in text:
+        print(f"skip {label}: already patched")
+        return
+    matches = [(old, new) for old, new in variants if text.count(old) == 1]
+    if len(matches) != 1:
+        count = sum(text.count(old) for old, _ in variants)
+        raise RuntimeError(
+            f"{label}: expected one compatible match in {TARGETS[target]}, found {count}"
+        )
+    old, new = matches[0]
+    texts[target] = text.replace(old, new)
+    changed.add(target)
+    print(f"patched {label}")
+
+
+replace_once_variant(
+    "agent session",
+    "durable queue import",
+    (
+        (
+            '''import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+''',
+            '''import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { DurableMessageQueue, getDurableMessageId, preserveDurableMessageId } from "./durable-message-queue.js";
+''',
+        ),
+        (
+            '''import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.js";
+''',
+            '''import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.js";
+import { DurableMessageQueue, getDurableMessageId, preserveDurableMessageId } from "./durable-message-queue.js";
+''',
+        ),
+    ),
+    'from "./durable-message-queue.js";',
+)
+
+replace_once(
+    "agent session",
+    "queued-prompt agent entrypoint",
+    '''    async _runAgentPrompt(messages) {
+        this._isAgentRunActive = true;
+        try {
+            await this.agent.prompt(messages);
+''',
+    '''    async _runAgentPrompt(messages, queuedPrompt = false) {
+        this._isAgentRunActive = true;
+        try {
+            await (queuedPrompt ? this.agent.promptFromQueue(messages) : this.agent.prompt(messages));
+''',
+    "queuedPrompt ? this.agent.promptFromQueue(messages)",
+)
+
+replace_once(
+    "agent session",
+    "durable queue fields",
+    '''    /** Messages queued to be included with the next user prompt as context ("asides"). */
+    _pendingNextTurnMessages = [];
+''',
+    '''    /** Messages queued to be included with the next user prompt as context ("asides"). */
+    _pendingNextTurnMessages = [];
+    _durableMessageQueue;
+    _durableQueueRecoveryStarted = false;
+    _durableRecoveryPromise;
+''',
+    "_durableQueueRecoveryStarted = false;",
+)
+
+replace_once(
+    "agent session",
+    "durable queue construction",
+    '''        this.sessionManager = config.sessionManager;
+        this.settingsManager = config.settingsManager;
+''',
+    '''        this.sessionManager = config.sessionManager;
+        this._durableMessageQueue = new DurableMessageQueue(this.sessionManager);
+        this.settingsManager = config.settingsManager;
+''',
+    "this._durableMessageQueue = new DurableMessageQueue(this.sessionManager);",
+)
+
+replace_once(
+    "agent session",
+    "durable event identity capture",
+    '''    _handleAgentEvent = async (event) => {
+        // When a user message starts, check if it's from either queue and remove it BEFORE emitting
+''',
+    '''    _handleAgentEvent = async (event) => {
+        // A message_end extension may replace the object. Keep the durable identity attached
+        // until SessionManager has committed the corresponding entry.
+        const durableMessageId = "message" in event ? getDurableMessageId(event.message) : undefined;
+        // When a user message starts, check if it's from either queue and remove it BEFORE emitting
+''',
+    'const durableMessageId = "message" in event ? getDurableMessageId(event.message) : undefined;',
+)
+
+replace_once(
+    "agent session",
+    "durable identity preservation",
+    '''        // Emit to extensions first
+        await this._emitExtensionEvent(event);
+        // Notify all listeners
+''',
+    '''        // Emit to extensions first
+        await this._emitExtensionEvent(event);
+        if (durableMessageId && "message" in event) {
+            preserveDurableMessageId(event.message, durableMessageId);
+        }
+        // Notify all listeners
+''',
+    "preserveDurableMessageId(event.message, durableMessageId);",
+)
+
+replace_once(
+    "agent session",
+    "persist custom durable identity outside extension details",
+    '''                this.sessionManager.appendCustomMessageEntry(event.message.customType, event.message.content, event.message.display, event.message.details);
+''',
+    '''                this.sessionManager.appendCustomMessageEntry(event.message.customType, event.message.content, event.message.display, event.message.details, durableMessageId);
+''',
+    "event.message.details, durableMessageId);",
+)
+
+replace_once(
+    "agent session",
+    "durable acknowledgement",
+    '''            // Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+            // Track assistant message for auto-compaction (checked on agent_end)
+''',
+    '''            // Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+            // Queue records are removed only after the JSONL is physically present. This also
+            // reconciles the crash window between SessionManager append and queue acknowledgement.
+            this._durableMessageQueue.reconcileCommitted(durableMessageId);
+            // Track assistant message for auto-compaction (checked on agent_end)
+''',
+    "this._durableMessageQueue.reconcileCommitted(",
+)
+
+replace_once(
+    "agent session",
+    "durable queue disposal",
+    '''        this._disconnectFromAgent();
+        this._eventListeners = [];
+        cleanupSessionResources(this.sessionId);
+''',
+    '''        this._disconnectFromAgent();
+        this._durableMessageQueue.dispose();
+        this._eventListeners = [];
+        cleanupSessionResources(this.sessionId);
+''',
+    "this._durableMessageQueue.dispose();",
+)
+
+replace_once(
+    "agent session",
+    "durable user queues and recovery",
+    '''    async _queueSteer(text, images) {
+        this._steeringMessages.push(text);
+        this._emitQueueUpdate();
+        const content = [{ type: "text", text }];
+        if (images) {
+            content.push(...images);
+        }
+        this.agent.steer({
+            role: "user",
+            content,
+            timestamp: Date.now(),
+        });
+    }
+    /**
+     * Internal: Queue a follow-up message (already expanded, no extension command check).
+     */
+    async _queueFollowUp(text, images) {
+        this._followUpMessages.push(text);
+        this._emitQueueUpdate();
+        const content = [{ type: "text", text }];
+        if (images) {
+            content.push(...images);
+        }
+        this.agent.followUp({
+            role: "user",
+            content,
+            timestamp: Date.now(),
+        });
+    }
+''',
+    '''    async _queueSteer(text, images) {
+        const content = [{ type: "text", text }];
+        if (images) {
+            content.push(...images);
+        }
+        this._queueDurableMessage("steer", {
+            role: "user",
+            content,
+            timestamp: Date.now(),
+        });
+        this._steeringMessages.push(text);
+        this._emitQueueUpdate();
+    }
+    /**
+     * Internal: Queue a follow-up message (already expanded, no extension command check).
+     */
+    async _queueFollowUp(text, images) {
+        const content = [{ type: "text", text }];
+        if (images) {
+            content.push(...images);
+        }
+        this._queueDurableMessage("followUp", {
+            role: "user",
+            content,
+            timestamp: Date.now(),
+        });
+        this._followUpMessages.push(text);
+        this._emitQueueUpdate();
+    }
+    _queueDurableMessage(behavior, message) {
+        const durableMessage = this._durableMessageQueue.enqueue(behavior, message);
+        try {
+            if (behavior === "followUp") {
+                this.agent.followUp(durableMessage);
+            }
+            else {
+                this.agent.steer(durableMessage);
+            }
+        }
+        catch (error) {
+            this._durableMessageQueue.discardMessages([durableMessage]);
+            throw error;
+        }
+        return durableMessage;
+    }
+    _enqueueRecoveredMessage(record) {
+        if (record.behavior === "followUp") {
+            this.agent.followUp(record.message);
+        }
+        else {
+            this.agent.steer(record.message);
+        }
+        if (record.message.role !== "user") return;
+        const text = contentText(record.message.content, "");
+        if (record.behavior === "followUp") {
+            this._followUpMessages.push(text);
+        }
+        else {
+            this._steeringMessages.push(text);
+        }
+    }
+    async _recoverDurableMessages() {
+        if (this._durableQueueRecoveryStarted) return;
+        this._durableQueueRecoveryStarted = true;
+        let recovery;
+        try {
+            recovery = await this._durableMessageQueue.loadRecoverable();
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this._extensionUIContext?.notify(`Queued-message recovery failed; pending records were retained: ${message}`, "warning");
+            return;
+        }
+        if (recovery.invalidCount > 0) {
+            this._extensionUIContext?.notify(`${recovery.invalidCount} malformed durable queue record(s) were retained for inspection.`, "warning");
+        }
+        if (recovery.skippedScopeCount > 0) {
+            this._extensionUIContext?.notify(`${recovery.skippedScopeCount} queued record(s) belong to another session file or branch and were left untouched.`, "warning");
+        }
+        if (recovery.records.length === 0) return;
+        this._extensionUIContext?.notify(`Recovered ${recovery.records.length} queued message(s) from the interrupted session.`, "info");
+        if (this.isStreaming) {
+            for (const record of recovery.records) this._enqueueRecoveredMessage(record);
+            this._emitQueueUpdate();
+            return;
+        }
+        const steeringRecords = recovery.records.filter((record) => record.behavior === "steer");
+        const initialCandidates = steeringRecords.length > 0
+            ? steeringRecords
+            : recovery.records;
+        const initialMode = steeringRecords.length > 0
+            ? this.agent.steeringMode
+            : this.agent.followUpMode;
+        const initialRecords = initialMode === "all" ? initialCandidates : initialCandidates.slice(0, 1);
+        const initialIds = new Set(initialRecords.map((record) => record.id));
+        const remaining = recovery.records.filter((record) => !initialIds.has(record.id));
+        for (const record of remaining) this._enqueueRecoveredMessage(record);
+        this._emitQueueUpdate();
+        const recoveryPromise = this._runAgentPrompt(initialRecords.map((record) => record.message), true).catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            this._extensionUIContext?.notify(`Recovered queued messages remain durable after delivery failed: ${message}`, "warning");
+        });
+        this._durableRecoveryPromise = recoveryPromise;
+        void recoveryPromise.finally(() => {
+            if (this._durableRecoveryPromise === recoveryPromise) this._durableRecoveryPromise = undefined;
+        });
+    }
+''',
+    "_recoverDurableMessages() {",
+)
+
+replace_once(
+    "agent session",
+    "wait for automatic recovery before an ordinary prompt",
+    '''            // If streaming, queue via steer() or followUp() based on option
+            if (this.isStreaming) {
+''',
+    '''            // An ordinary startup prompt must run after automatic recovery. Explicit
+            // steering/follow-up input remains queueable into the recovered run.
+            if (this._durableRecoveryPromise && !options?.streamingBehavior) {
+                await this._durableRecoveryPromise;
+            }
+            // If streaming, queue via steer() or followUp() based on option
+            if (this.isStreaming) {
+''',
+    "await this._durableRecoveryPromise;",
+)
+
+replace_once(
+    "agent session",
+    "durable custom queues",
+    '''        else if (this.isStreaming && options?.triggerTurn !== false) {
+            if (options?.deliverAs === "followUp") {
+                this.agent.followUp(appMessage);
+            }
+            else {
+                this.agent.steer(appMessage);
+            }
+        }
+''',
+    '''        else if (this.isStreaming && options?.triggerTurn !== false) {
+            this._queueDurableMessage(options?.deliverAs === "followUp" ? "followUp" : "steer", appMessage);
+        }
+''',
+    'this._queueDurableMessage(options?.deliverAs === "followUp" ? "followUp" : "steer", appMessage);',
+)
+
+replace_once(
+    "agent session",
+    "durable queue cancellation",
+    '''        this._steeringMessages = [];
+        this._followUpMessages = [];
+        this.agent.clearAllQueues();
+        this._emitQueueUpdate();
+''',
+    '''        const queuedMessages = this.agent.getQueuedMessages();
+        let discardFailures;
+        try {
+            discardFailures = this._durableMessageQueue.discardMessages(queuedMessages);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this._extensionUIContext?.notify(`Queued messages were not cleared because durable cancellation failed: ${message}`, "warning");
+            return { steering: [], followUp: [] };
+        }
+        this.agent.clearAllQueues();
+        this._steeringMessages = [];
+        this._followUpMessages = [];
+        if (discardFailures > 0) {
+            this._extensionUIContext?.notify("Canceled queue cleanup is deferred to the next recovery.", "warning");
+        }
+        this._emitQueueUpdate();
+''',
+    "discardFailures = this._durableMessageQueue.discardMessages(",
+)
+
+replace_once(
+    "agent session",
+    "durable startup recovery",
+    '''        await this._extensionRunner.emit(this._sessionStartEvent);
+        await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+''',
+    '''        await this._extensionRunner.emit(this._sessionStartEvent);
+        await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+        await this._recoverDurableMessages();
+''',
+    "this._recoverDurableMessages();",
+)
+
+replace_once(
+    "session manager",
+    "durable pending-session fsync imports",
+    '''import { appendFileSync, closeSync, createReadStream, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, writeFileSync, } from "fs";
+''',
+    '''import { appendFileSync, closeSync, createReadStream, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readSync, statSync, unlinkSync, writeFileSync, } from "fs";
+''',
+    "existsSync, fsyncSync, linkSync, mkdirSync",
+)
+
+replace_once(
+    "session manager",
+    "durable pending-session path import",
+    '''import { join, resolve } from "path";
+''',
+    '''import { dirname, join, resolve } from "path";
+''',
+    'import { dirname, join, resolve } from "path";',
+)
+
+replace_once(
+    "session manager",
+    "materialize pending session before durable queue acceptance",
+    '''    getSessionFile() {
+        return this.sessionFile;
+    }
+    _persist(entry) {
+''',
+    '''    getSessionFile() {
+        return this.sessionFile;
+    }
+    flushPendingEntries() {
+        if (!this.persist || !this.sessionFile || this.flushed)
+            return;
+        const temporaryPath = `${this.sessionFile}.${process.pid}.${randomUUID()}.tmp`;
+        let fd;
+        try {
+            fd = openSync(temporaryPath, "wx");
+            for (const entry of this.fileEntries) {
+                writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+            }
+            fsyncSync(fd);
+            closeSync(fd);
+            fd = undefined;
+            linkSync(temporaryPath, this.sessionFile);
+            this.flushed = true;
+            unlinkSync(temporaryPath);
+            const directoryFd = openSync(dirname(this.sessionFile), "r");
+            try {
+                fsyncSync(directoryFd);
+            }
+            finally {
+                closeSync(directoryFd);
+            }
+        }
+        catch (error) {
+            if (fd !== undefined) {
+                try {
+                    closeSync(fd);
+                }
+                catch {
+                    // Preserve the original write failure.
+                }
+            }
+            try {
+                unlinkSync(temporaryPath);
+            }
+            catch {
+                // The temporary link may already have been removed.
+            }
+            throw error;
+        }
+    }
+    _persist(entry) {
+''',
+    "flushPendingEntries() {",
+)
+
+replace_once(
+    "session manager",
+    "persist custom durable queue identity",
+    '''    appendCustomMessageEntry(customType, content, display, details) {
+        const entry = {
+            type: "custom_message",
+            customType,
+            content,
+            display,
+            details,
+            id: generateId(this.byId),
+''',
+    '''    appendCustomMessageEntry(customType, content, display, details, durableQueueId) {
+        const entry = {
+            type: "custom_message",
+            customType,
+            content,
+            display,
+            details,
+            ...(durableQueueId ? { durableQueueId } : {}),
+            id: generateId(this.byId),
+''',
+    "...(durableQueueId ? { durableQueueId } : {}),",
+)
+
+replace_once(
+    "session manager types",
+    "pending session materialization type",
+    '''    getSessionFile(): string | undefined;
+    _persist(entry: SessionEntry): void;
+''',
+    '''    getSessionFile(): string | undefined;
+    /** Materialize and fsync deferred entries before accepting crash-durable queued input. */
+    flushPendingEntries(): void;
+    _persist(entry: SessionEntry): void;
+''',
+    "flushPendingEntries(): void;",
+)
+
+replace_once(
+    "session manager types",
+    "custom durable queue identity type",
+    '''    details?: T;
+    display: boolean;
+''',
+    '''    details?: T;
+    /** Internal identity used to reconcile crash-durable queued messages. */
+    durableQueueId?: string;
+    display: boolean;
+''',
+    "durableQueueId?: string;",
+)
+
+replace_once(
+    "session manager types",
+    "custom durable queue append type",
+    '''    appendCustomMessageEntry<T = unknown>(customType: string, content: string | (TextContent | ImageContent)[], display: boolean, details?: T): string;
+''',
+    '''    appendCustomMessageEntry<T = unknown>(customType: string, content: string | (TextContent | ImageContent)[], display: boolean, details?: T, durableQueueId?: string): string;
+''',
+    "details?: T, durableQueueId?: string): string;",
+)
+
+replace_once(
+    "agent core",
+    "snapshot pending agent queues",
+    '''    clear() {
+''',
+    '''    snapshot() {
+        return this.messages.slice();
+    }
+    clear() {
+''',
+    "snapshot() {",
+)
+
+replace_once(
+    "agent core",
+    "queued prompt semantics entrypoint",
+    '''    /** Continue from the current transcript. The last message must be a user or tool-result message. */
+    async continue() {
+''',
+    '''    /** Start queued messages without polling steering again before the first response. */
+    async promptFromQueue(input) {
+        if (this.activeRun) {
+            throw new Error("Agent is already processing.");
+        }
+        const messages = this.normalizePromptInput(input);
+        await this.runPromptMessages(messages, { skipInitialSteeringPoll: true });
+    }
+    /** Continue from the current transcript. The last message must be a user or tool-result message. */
+    async continue() {
+''',
+    "async promptFromQueue(input) {",
+)
+
+replace_once(
+    "agent core",
+    "inspect pending agent queues",
+    '''    /** Remove all queued steering messages. */
+    clearSteeringQueue() {
+''',
+    '''    /** Return queued messages without removing them. */
+    getQueuedMessages() {
+        return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()];
+    }
+    /** Remove all queued steering messages. */
+    clearSteeringQueue() {
+''',
+    "getQueuedMessages() {",
+)
+
+replace_once(
+    "agent core",
+    "return cleared agent queues",
+    '''    clear() {
+        this.messages = [];
+    }
+''',
+    '''    clear() {
+        const cleared = this.messages;
+        this.messages = [];
+        return cleared;
+    }
+''',
+    "const cleared = this.messages;",
+)
+
+replace_once(
+    "agent core",
+    "return cleared agent queue groups",
+    '''    clearSteeringQueue() {
+        this.steeringQueue.clear();
+    }
+    /** Remove all queued follow-up messages. */
+    clearFollowUpQueue() {
+        this.followUpQueue.clear();
+    }
+    /** Remove all queued steering and follow-up messages. */
+    clearAllQueues() {
+        this.clearSteeringQueue();
+        this.clearFollowUpQueue();
+    }
+''',
+    '''    clearSteeringQueue() {
+        return this.steeringQueue.clear();
+    }
+    /** Remove all queued follow-up messages. */
+    clearFollowUpQueue() {
+        return this.followUpQueue.clear();
+    }
+    /** Remove all queued steering and follow-up messages. */
+    clearAllQueues() {
+        return [...this.clearSteeringQueue(), ...this.clearFollowUpQueue()];
+    }
+''',
+    "return [...this.clearSteeringQueue(), ...this.clearFollowUpQueue()];",
+)
+
+replace_once(
+    "agent core types",
+    "queued prompt semantics entrypoint type",
+    '''    prompt(input: string, images?: ImageContent[]): Promise<void>;
+    /** Continue from the current transcript. The last message must be a user or tool-result message. */
+''',
+    '''    prompt(input: string, images?: ImageContent[]): Promise<void>;
+    /** Start queued messages without polling steering again before the first response. */
+    promptFromQueue(message: AgentMessage | AgentMessage[]): Promise<void>;
+    /** Continue from the current transcript. The last message must be a user or tool-result message. */
+''',
+    "promptFromQueue(message: AgentMessage | AgentMessage[]): Promise<void>;",
+)
+
+replace_once(
+    "agent core types",
+    "cleared agent queue return types",
+    '''    clearSteeringQueue(): void;
+    /** Remove all queued follow-up messages. */
+    clearFollowUpQueue(): void;
+    /** Remove all queued steering and follow-up messages. */
+    clearAllQueues(): void;
+''',
+    '''    clearSteeringQueue(): AgentMessage[];
+    /** Remove all queued follow-up messages. */
+    clearFollowUpQueue(): AgentMessage[];
+    /** Remove all queued steering and follow-up messages. */
+    clearAllQueues(): AgentMessage[];
+''',
+    "clearAllQueues(): AgentMessage[];",
+)
+
+replace_once(
+    "agent core types",
+    "queued agent message inspection type",
+    '''    /** Remove all queued steering messages. */
+    clearSteeringQueue(): AgentMessage[];
+''',
+    '''    /** Return queued messages without removing them. */
+    getQueuedMessages(): AgentMessage[];
+    /** Remove all queued steering messages. */
+    clearSteeringQueue(): AgentMessage[];
+''',
+    "getQueuedMessages(): AgentMessage[];",
+)
+
+def validate_javascript(label: str, text: str) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf8", suffix=".mjs", dir="/tmp", delete=False) as handle:
+            handle.write(text)
+            temporary = handle.name
+        result = subprocess.run(
+            ["node", "--check", temporary],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"{label}: generated invalid JavaScript: {result.stderr.strip()}")
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def atomic_replace(path: Path, data: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    fd = None
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise OSError("short write while installing durable queue patch")
+            offset += written
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # The validated atomic replacement is already visible. Keep it accepted
+            # so rerunning the patch cannot observe a reported-failure ghost.
+            pass
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+if not HELPER_SOURCE.is_file():
+    raise RuntimeError(f"missing durable queue helper: {HELPER_SOURCE}")
+for name in changed:
+    if TARGETS[name].suffix == ".js":
+        validate_javascript(name, texts[name])
+validate_javascript("durable queue helper", HELPER_SOURCE.read_text("utf8"))
+
+for name in changed:
+    target = TARGETS[name]
+    mode = stat.S_IMODE(target.stat().st_mode)
+    atomic_replace(target, texts[name].encode("utf8"), mode)
+
+atomic_replace(HELPER_TARGET, HELPER_SOURCE.read_bytes(), 0o644)
+print(f"installed durable queue helper: {HELPER_TARGET}")

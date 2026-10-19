@@ -34,7 +34,7 @@ function assistant(text: string, timestamp: number): AssistantMessage {
 		content: [{ type: "text", text }],
 		api: "openai-codex-responses",
 		provider: "openai-codex",
-		model: "gpt-5.6-sol",
+		model: "gpt-6-sol",
 		usage,
 		stopReason: "stop",
 		timestamp,
@@ -127,6 +127,7 @@ test("temporary child session preserves selected messages and private permission
 		assert.equal(statSync(temporary.filePath).mode & 0o777, 0o600);
 		const records = readFileSync(temporary.filePath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 		assert.equal(records[0].version, CURRENT_SESSION_VERSION);
+		assert.equal(temporary.sessionId, records[0].id);
 		assert.equal(records[0].cwd, "/tmp/fork-child-cwd");
 		assert.equal(records[0].parentSession, "/tmp/parent.jsonl");
 		assert.equal(records[1].type, "compaction");
@@ -157,6 +158,8 @@ test("resumable child session uses a private durable root", async () => {
 			root,
 		);
 		assert.match(resumable.runId, /^[0-9a-f-]{36}$/);
+		assert.match(resumable.sessionId!, /^[0-9a-f-]{36}$/);
+		assert.equal(SessionManager.open(resumable.filePath).getSessionId(), resumable.sessionId);
 		assert.equal(path.dirname(resumable.dir), root);
 		assert.equal(statSync(root).mode & 0o777, 0o700);
 		assert.equal(statSync(resumable.dir).mode & 0o777, 0o700);
@@ -175,6 +178,7 @@ test("fork adoption clones the mutable child transcript into a new private run",
 		const cloned = await cloneResumableForkSession(source, path.join(temporaryRoot, "clone"));
 		assert.notEqual(cloned.runId, source.runId);
 		assert.notEqual(cloned.filePath, source.filePath);
+		assert.equal(cloned.sessionId, source.sessionId);
 		assert.equal(cloned.baselineEntryId, source.baselineEntryId);
 		assert.deepEqual(
 			SessionManager.open(cloned.filePath).buildSessionContext().messages,

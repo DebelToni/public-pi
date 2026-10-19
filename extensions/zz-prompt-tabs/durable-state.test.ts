@@ -149,6 +149,7 @@ test("an interrupted atomic replacement leaves the last complete state usable", 
 		...previous,
 		updatedAt: previous.updatedAt + 1,
 		tabs: [{ text: "incomplete" }],
+		closedTabs: [],
 	};
 
 	assert.throws(
@@ -160,6 +161,38 @@ test("an interrupted atomic replacement leaves the last complete state usable", 
 		{ texts: ["complete"], activeIndex: 0 },
 	);
 	assert.equal(readdirSync(location.directory).some((name) => name.endsWith(".tmp")), false);
+});
+
+test("closed tabs persist in LIFO order with exact restoration metadata", (t) => {
+	const { stateRoot, sessionPath } = fixture(t);
+	const sessionFile = sessionPath("closed");
+	writeSession(sessionFile, "closed-id");
+	const closedTabs = [
+		{ text: "older", closedAt: 10, index: 0, wasOnlyTab: false },
+		{ text: "newer\nmultiline", closedAt: 20, index: 2, wasOnlyTab: true },
+	];
+	new DurablePromptTabsStore("closed-id", sessionFile, stateRoot).save(exactSnapshot, closedTabs);
+
+	const loaded = new DurablePromptTabsStore("closed-id", sessionFile, stateRoot).load();
+	assert.deepEqual(loaded.snapshot, exactSnapshot);
+	assert.deepEqual(loaded.closedTabs, closedTabs);
+});
+
+test("version-one open-tab state migrates without losing its drafts", (t) => {
+	const { stateRoot, sessionPath } = fixture(t);
+	const sessionFile = sessionPath("legacy");
+	writeSession(sessionFile, "legacy-id");
+	new DurablePromptTabsStore("legacy-id", sessionFile, stateRoot).save(exactSnapshot);
+	const location = onlyStateFile(stateRoot);
+	const legacy = JSON.parse(readFileSync(location.path, "utf8"));
+	legacy.version = 1;
+	delete legacy.closedTabs;
+	writeFileSync(location.path, `${JSON.stringify(legacy)}\n`);
+
+	const loaded = new DurablePromptTabsStore("legacy-id", sessionFile, stateRoot).load();
+	assert.deepEqual(loaded.snapshot, exactSnapshot);
+	assert.deepEqual(loaded.closedTabs, []);
+	assert.deepEqual(loaded.diagnostics, []);
 });
 
 test("a deferred new-session path persists before its JSONL exists", (t) => {

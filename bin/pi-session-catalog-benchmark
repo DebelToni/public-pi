@@ -1,0 +1,104 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+	catalogStatus,
+	defaultCatalogPath,
+	defaultSessionsRoot,
+	discoverSessionFiles,
+	listCatalogSessions,
+	reconcileCatalog,
+	searchCatalog,
+	verifyCatalog,
+} from "../lib/session-catalog/index.mjs";
+
+const QUERIES = ["session search", "google search", "runpod gpu"];
+function parse(argv) {
+	const options = { repetitions: 10 };
+	while (argv.length) {
+		const arg = argv.shift();
+		if (arg === "--fresh") options.fresh = true;
+		else if (arg === "--cwd") options.cwd = path.resolve(argv.shift());
+		else if (arg === "--sessions-root") options.sessionsRoot = path.resolve(argv.shift());
+		else if (arg === "--database") { options.databasePath = path.resolve(argv.shift()); options.databaseExplicit = true; }
+		else if (arg === "--output") options.output = path.resolve(argv.shift());
+		else if (arg === "--repetitions") options.repetitions = Number(argv.shift());
+		else if (arg === "--help" || arg === "-h") {
+			console.log("Usage: pi-session-catalog-benchmark --cwd PATH [--fresh] [--database PATH] [--output PATH] [--repetitions N]");
+			process.exit(0);
+		} else throw new Error(`unknown argument: ${arg}`);
+	}
+	if (!options.cwd) throw new Error("--cwd is required");
+	if (!Number.isInteger(options.repetitions) || options.repetitions < 1 || options.repetitions > 1000) throw new Error("--repetitions must be 1..1000");
+	options.sessionsRoot ??= defaultSessionsRoot();
+	const liveDefault = path.resolve(defaultCatalogPath(options.sessionsRoot));
+	options.databasePath ??= liveDefault;
+	if (options.fresh) {
+		if (!options.databaseExplicit) throw new Error("--fresh requires an explicit isolated --database path");
+		if (options.databasePath === liveDefault) throw new Error("--fresh refuses the default live session-store database");
+		if (fs.existsSync(`${options.databasePath}.writer-lock`) || fs.existsSync(`${options.databasePath}.writer-lock.reap`)) {
+			throw new Error("--fresh refuses a database with a live or unresolved writer lock");
+		}
+	}
+	options.output ??= path.join(os.homedir(), "tmp", `pi-session-store-benchmark-${Date.now()}.json`);
+	delete options.databaseExplicit;
+	return options;
+}
+const percentile = (values, fraction) => [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * fraction))] ?? 0;
+function removeDatabase(databasePath) {
+	const lockPath = `${databasePath}.writer-lock`;
+	fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
+	let lockFd;
+	try {
+		lockFd = fs.openSync(lockPath, "wx", 0o600);
+		fs.writeFileSync(lockFd, `${process.pid}\n${Date.now()}\nbenchmark-fresh\n`);
+		for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(`${databasePath}${suffix}`, { force: true });
+	} catch (error) {
+		if (error?.code === "EEXIST") throw new Error("--fresh refuses a database with a live or unresolved writer lock");
+		throw error;
+	} finally {
+		if (lockFd !== undefined) { fs.closeSync(lockFd); fs.rmSync(lockPath, { force: true }); }
+	}
+}
+function snapshot(files) {
+	return files.map(({ filePath }) => { const stat = fs.statSync(filePath, { bigint: true }); return { path: filePath, size: String(stat.size), mtimeNs: String(stat.mtimeNs), ino: String(stat.ino) }; });
+}
+
+async function main() {
+	const options = parse(process.argv.slice(2));
+	const beforeDiscovery = discoverSessionFiles({ sessionsRoot: options.sessionsRoot, cwd: options.cwd });
+	if (!beforeDiscovery.complete) throw new Error(`source discovery incomplete: ${JSON.stringify(beforeDiscovery.failures)}`);
+	if (!beforeDiscovery.files.length) throw new Error(`no session files for ${options.cwd}`);
+	const before = snapshot(beforeDiscovery.files);
+	if (options.fresh) removeDatabase(options.databasePath);
+	const initial = await reconcileCatalog(options);
+	const noChange = await reconcileCatalog(options);
+	const listTimes = [], search = [];
+	let listed;
+	for (let i = 0; i < options.repetitions; i++) {
+		const started = performance.now(); listed = listCatalogSessions({ ...options, limit: 100_000 }); listTimes.push(performance.now() - started);
+	}
+	for (const query of QUERIES) {
+		const times = []; let response;
+		for (let i = 0; i < options.repetitions; i++) {
+			const started = performance.now(); response = searchCatalog(query, { ...options, limit: 1000 }); times.push(performance.now() - started);
+		}
+		search.push({ query, hits: response.results.length, medianMs: percentile(times, 0.5), p95Ms: percentile(times, 0.95) });
+	}
+	const verify = await verifyCatalog(options);
+	const after = snapshot(discoverSessionFiles({ sessionsRoot: options.sessionsRoot, cwd: options.cwd }).files);
+	const unchangedSource = JSON.stringify(before) === JSON.stringify(after);
+	const report = {
+		generatedAt: new Date().toISOString(), valid: initial.scopeComplete && noChange.scopeComplete && verify.ok && unchangedSource,
+		configuration: options, corpus: { files: before.length, bytes: before.reduce((sum, item) => sum + Number(item.size), 0), unchangedSource },
+		initial, noChange, list: { sessions: listed.length, medianMs: percentile(listTimes, 0.5), p95Ms: percentile(listTimes, 0.95) },
+		search, verify, status: catalogStatus(options),
+		cacheNote: "OS filesystem cache was not purged; timings are not labeled cold",
+	};
+	fs.mkdirSync(path.dirname(options.output), { recursive: true });
+	fs.writeFileSync(options.output, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
+	console.log(JSON.stringify({ output: options.output, ...report }, null, 2));
+	if (!report.valid) process.exitCode = 1;
+}
+main().catch((error) => { console.error(`pi-session-catalog-benchmark: ${error instanceof Error ? error.stack ?? error.message : String(error)}`); process.exitCode = 1; });

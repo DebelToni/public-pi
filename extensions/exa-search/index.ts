@@ -12,11 +12,10 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 const EXA_API_URL = "https://api.exa.ai";
-const EXA_ENV_PATH = join(homedir(), ".env-EXA");
+const EXA_ENV_PATH = join(getAgentDir(), ".env");
 const EXA_ACCOUNT_STATE_PATH = join(getAgentDir(), "exa-search-runtime", "account.json");
 const EXA_KEY_NAME = /^EXA_API_KEY(?:_(\d+))?$/;
 const EXA_USAGE_NOTE = "Usage remaining: unavailable to ordinary Exa API keys. Exa's per-key usage endpoint reports spend, requires separate Team Management service credentials, and does not expose remaining monthly credits.";

@@ -36,3 +36,12 @@ test("expanded delivered text consumes the next queued draft by queue order", ()
 	tracker.consume("expanded template content");
 	assert.deepEqual(tracker.recall("plain second"), ["plain second"]);
 });
+
+test("native reconciliation drops a cancelled invocation and preserves duplicate remaining prompts", () => {
+	const tracker = new QueuedDraftTracker();
+	tracker.track("/skill:cancelled", "followUp");
+	const native = [{ text: "same", behavior: "followUp" as const }, { text: "same", behavior: "followUp" as const }];
+	tracker.reconcile(native);
+	native[0].text = "changed outside tracker";
+	assert.deepEqual(tracker.recall("same\n\nsame"), ["same", "same"]);
+});

@@ -4,7 +4,7 @@ import test from "node:test";
 import { BTW_LOG_SCHEMA_VERSION, BtwRunLogger, payloadDiagnostics } from "./log.ts";
 
 const payload = {
-	model: "gpt-5.6-sol",
+	model: "gpt-6-sol",
 	prompt_cache_key: "shared-key",
 	input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
 };

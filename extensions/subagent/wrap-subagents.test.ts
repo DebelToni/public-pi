@@ -1,3 +1,4 @@
+import { readResultPage } from "./result-store.ts";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -135,5 +136,5 @@ setTimeout(() => process.exit(2), 5000);
 	assert.equal(existsSync(agentStartedMarker), false, "a startup wrap request must be retained before agent_start");
 	const result = await running;
 	assert.equal(result.exitCode, 0);
-	assert.equal((result.messages.at(-1)?.content[0] as any).text, WRAP_SUBAGENT_MESSAGE);
+	assert.equal((readResultPage(result).messages.at(-1)?.content[0] as any).text, WRAP_SUBAGENT_MESSAGE);
 });

@@ -122,6 +122,15 @@ async function installCompactPatches() {
 	try {
 		const interactive = await import(codingAgentInternal("modes/interactive/interactive-mode.js"));
 		const proto = interactive.InteractiveMode?.prototype;
+		if (proto?.showExtensionNotify && !proto.__piCustomQuietExtensionHealth) {
+			const original = proto.showExtensionNotify;
+			proto.showExtensionNotify = function (message: string, type?: string) {
+				// Routine Ultra conflict accounting stays in /u d and /config; skipped extensions still warn.
+				if ((type === undefined || type === "info") && /^Extensions: \d+ optional loaded · 0 skipped · \d+ managed conflicts suppressed\. Use \/u d and \/config for details\.$/.test(message)) return;
+				return original.call(this, message, type);
+			};
+			proto.__piCustomQuietExtensionHealth = true;
+		}
 		if (proto?.renderWidgetContainer && !proto.__piCustomCompactWidgets) {
 			const original = proto.renderWidgetContainer;
 			proto.renderWidgetContainer = function (container: any, widgets: Map<string, any>, _spacerWhenEmpty: boolean, _leadingSpacer: boolean) {

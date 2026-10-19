@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
@@ -55,10 +55,14 @@ test("continuation manifests use private permissions and atomic same-directory r
 		assert.equal(listContinuationManifests(root).length, 2);
 		assert.equal(readContinuationManifest<typeof manifest.args, typeof manifest.details>(manifest.id, root, "session-1")?.details.value, 50);
 		assert.equal(readContinuationManifest<typeof manifest.args, typeof manifest.details>(manifest.id, root, "session-2")?.details.value, 99);
+		mkdirSync(first.childrenRoot);
+		const child = path.join(first.childrenRoot, "session.jsonl");
+		writeFileSync(child, "durable child evidence\n");
 		removeContinuation(manifest.id, manifest.parentSessionId, root);
 		removeContinuation(secondManifest.id, secondManifest.parentSessionId, root);
-		assert.equal(existsSync(first.dir), false);
-		assert.equal(existsSync(second.dir), false);
+		assert.equal(existsSync(first.filePath), false);
+		assert.equal(existsSync(second.filePath), false);
+		assert.equal(readFileSync(child, "utf8"), "durable child evidence\n");
 	} finally {
 		rmSync(temporary, { recursive: true, force: true });
 	}

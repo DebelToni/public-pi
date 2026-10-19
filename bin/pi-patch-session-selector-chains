@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+
+TARGET = Path(os.environ.get(
+    "PI_SESSION_SELECTOR_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/session-selector.js",
+))
+text = TARGET.read_text("utf8")
+changed = False
+
+
+def replace_once(label: str, old: str, new: str, marker: str | None = None):
+    global text, changed
+    if marker and marker in text:
+        print(f"skip {label}: already patched")
+        return
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected one match, found {count}")
+    text = text.replace(old, new)
+    changed = True
+    print(f"patched {label}")
+
+
+replace_once(
+    "own modified helper",
+    '''function canonicalizePath(path) {
+    if (!path)
+        return path;
+    return _canonicalizePath(path);
+}
+''',
+    '''function canonicalizePath(path) {
+    if (!path)
+        return path;
+    return _canonicalizePath(path);
+}
+function getOwnModified(session) {
+    return session.__piOwnModified instanceof Date ? session.__piOwnModified : session.modified;
+}
+''',
+    '''function getOwnModified(session)''',
+)
+
+replace_once(
+    "tree own modified node",
+    '''    for (const session of sessions) {
+        const sessionPath = canonicalizePath(session.path) ?? session.path;
+        byPath.set(sessionPath, { session, children: [], latestActivity: session.modified.getTime() });
+    }
+''',
+    '''    for (const session of sessions) {
+        const sessionPath = canonicalizePath(session.path) ?? session.path;
+        const ownModified = getOwnModified(session);
+        byPath.set(sessionPath, { session, children: [], latestActivity: ownModified.getTime(), ownModified });
+    }
+''',
+    '''const ownModified = getOwnModified(session);''',
+)
+
+replace_once(
+    "tree latest activity",
+    '''    const updateLatestActivity = (node) => {
+        let latestActivity = node.session.modified.getTime();
+''',
+    '''    const updateLatestActivity = (node) => {
+        let latestActivity = node.ownModified.getTime();
+''',
+    '''node.ownModified.getTime()''',
+)
+
+replace_once(
+    "flatten collapsed chains",
+    '''function flattenSessionTree(roots) {
+    const result = [];
+    const walk = (node, depth, ancestorContinues, isLast) => {
+        result.push({ session: node.session, depth, isLast, ancestorContinues });
+        for (let i = 0; i < node.children.length; i++) {
+            const childIsLast = i === node.children.length - 1;
+            // Only show continuation line for non-root ancestors
+            const continues = depth > 0 ? !isLast : false;
+            walk(node.children[i], depth + 1, [...ancestorContinues, continues], childIsLast);
+        }
+    };
+    for (let i = 0; i < roots.length; i++) {
+        walk(roots[i], 0, [], i === roots.length - 1);
+    }
+    return result;
+}
+''',
+    '''function flattenSessionTree(roots, expandedChains = new Set()) {
+    const result = [];
+    const sessionKey = (session) => canonicalizePath(session.path) ?? session.path;
+    const walk = (node, depth, ancestorContinues, isLast) => {
+        const chain = [node];
+        let displayNode = node;
+        while (displayNode.children.length === 1) {
+            displayNode = displayNode.children[0];
+            chain.push(displayNode);
+        }
+        const collapsedAncestors = chain.length - 1;
+        const chainKey = sessionKey(displayNode.session);
+        const chainExpanded = collapsedAncestors > 0 && expandedChains.has(chainKey);
+        if (chainExpanded) {
+            for (let i = 0; i < chain.length; i++) {
+                result.push({
+                    session: chain[i].session,
+                    displayModified: chain[i].ownModified,
+                    depth: depth + i,
+                    isLast: true,
+                    ancestorContinues: [...ancestorContinues, ...Array(i).fill(false)],
+                    collapsedAncestors: i === 0 ? collapsedAncestors : 0,
+                    chainKey,
+                    chainExpanded: i === 0,
+                    expandedFrom: chainKey,
+                });
+            }
+        }
+        else {
+            result.push({ session: displayNode.session, displayModified: displayNode.ownModified, depth, isLast, ancestorContinues, collapsedAncestors, chainKey, chainExpanded });
+        }
+        const childDepth = depth + (chainExpanded ? chain.length : 1);
+        const childAncestors = chainExpanded
+            ? [...ancestorContinues, ...Array(chain.length - 1).fill(false), childDepth - 1 > 0 ? !isLast : false]
+            : [...ancestorContinues, depth > 0 ? !isLast : false];
+        for (let i = 0; i < displayNode.children.length; i++) {
+            const childIsLast = i === displayNode.children.length - 1;
+            walk(displayNode.children[i], childDepth, childAncestors, childIsLast);
+        }
+    };
+    for (let i = 0; i < roots.length; i++) {
+        walk(roots[i], 0, [], i === roots.length - 1);
+    }
+    return result;
+}
+''',
+    '''function flattenSessionTree(roots, expandedChains = new Set())''',
+)
+
+replace_once(
+    "expanded chains state",
+    '''    confirmingDeletePath = null;
+    currentSessionCanonicalPath;
+''',
+    '''    confirmingDeletePath = null;
+    expandedChains = new Set();
+    currentSessionCanonicalPath;
+''',
+    '''expandedChains = new Set();''',
+)
+
+replace_once(
+    "chain hint",
+    '''                keyHint("app.session.delete", "delete"),
+                keyHint("app.session.togglePath", `path ${pathState}`),
+''',
+    '''                keyHint("app.session.delete", "delete"),
+                keyHint("app.session.togglePath", `path ${pathState}`),
+                theme.fg("muted", "←/→ chain"),
+''',
+    '''←/→ chain''',
+)
+
+replace_once(
+    "threaded flatten call",
+    '''            const roots = buildSessionTree(nameFiltered);
+            this.filteredSessions = flattenSessionTree(roots);
+''',
+    '''            const roots = buildSessionTree(nameFiltered);
+            this.filteredSessions = flattenSessionTree(roots, this.expandedChains);
+''',
+    '''flattenSessionTree(roots, this.expandedChains)''',
+)
+
+replace_once(
+    "flat display modified",
+    '''            this.filteredSessions = filtered.map((session) => ({
+                session,
+                depth: 0,
+                isLast: true,
+                ancestorContinues: [],
+            }));
+''',
+    '''            this.filteredSessions = filtered.map((session) => ({
+                session,
+                displayModified: getOwnModified(session),
+                depth: 0,
+                isLast: true,
+                ancestorContinues: [],
+                collapsedAncestors: 0,
+            }));
+''',
+    '''displayModified: getOwnModified(session)''',
+)
+
+replace_once(
+    "collapse marker render",
+    '''            const prefix = this.buildTreePrefix(node);
+            // Session display text (name or first message)
+''',
+    '''            const collapseMarker = node.collapsedAncestors ? `${node.chainExpanded ? "▾" : "…"}${node.collapsedAncestors} ` : "";
+            const prefix = this.buildTreePrefix(node) + collapseMarker;
+            // Session display text (name or first message)
+''',
+    '''node.chainExpanded ? "▾" : "…"''',
+)
+
+replace_once(
+    "own age render",
+    '''            const age = formatSessionDate(session.modified);
+''',
+    '''            const age = formatSessionDate(node.displayModified ?? session.modified);
+''',
+    '''node.displayModified ?? session.modified''',
+)
+
+replace_once(
+    "expand collapse methods",
+    '''    buildTreePrefix(node) {
+        if (node.depth === 0) {
+            return "";
+        }
+        const parts = node.ancestorContinues.map((continues) => (continues ? "│  " : "   "));
+        const branch = node.isLast ? "└─ " : "├─ ";
+        return parts.join("") + branch;
+    }
+    handleInput(keyData) {
+''',
+    '''    buildTreePrefix(node) {
+        if (node.depth === 0) {
+            return "";
+        }
+        const parts = node.ancestorContinues.map((continues) => (continues ? "│  " : "   "));
+        const branch = node.isLast ? "└─ " : "├─ ";
+        return parts.join("") + branch;
+    }
+    selectSessionPath(path) {
+        const target = canonicalizePath(path) ?? path;
+        const idx = this.filteredSessions.findIndex((node) => (canonicalizePath(node.session.path) ?? node.session.path) === target);
+        if (idx !== -1) this.selectedIndex = idx;
+    }
+    expandSelectedChain() {
+        if (this.sortMode !== "threaded" || this.searchInput.getValue().trim()) return false;
+        const selected = this.filteredSessions[this.selectedIndex];
+        if (!selected?.collapsedAncestors || !selected.chainKey) return false;
+        this.expandedChains.add(selected.chainKey);
+        const selectedPath = selected.session.path;
+        this.filterSessions(this.searchInput.getValue());
+        this.selectSessionPath(selectedPath);
+        return true;
+    }
+    collapseSelectedChain() {
+        if (this.sortMode !== "threaded" || this.searchInput.getValue().trim()) return false;
+        const selected = this.filteredSessions[this.selectedIndex];
+        const chainKey = selected?.expandedFrom ?? (selected?.chainExpanded ? selected.chainKey : undefined);
+        if (!chainKey || !this.expandedChains.has(chainKey)) return false;
+        this.expandedChains.delete(chainKey);
+        this.filterSessions(this.searchInput.getValue());
+        this.selectSessionPath(chainKey);
+        return true;
+    }
+    handleInput(keyData) {
+''',
+    '''expandSelectedChain()''',
+)
+
+replace_once(
+    "arrow handlers",
+    '''        if (kb.matches(keyData, "app.session.deleteNoninvasive")) {
+            if (this.searchInput.getValue().length > 0) {
+                this.searchInput.handleInput(keyData);
+                this.filterSessions(this.searchInput.getValue());
+                return;
+            }
+            this.startDeleteConfirmationForSelectedSession();
+            return;
+        }
+        // Up arrow
+''',
+    '''        if (kb.matches(keyData, "app.session.deleteNoninvasive")) {
+            if (this.searchInput.getValue().length > 0) {
+                this.searchInput.handleInput(keyData);
+                this.filterSessions(this.searchInput.getValue());
+                return;
+            }
+            this.startDeleteConfirmationForSelectedSession();
+            return;
+        }
+        if (kb.matches(keyData, "tui.editor.cursorRight") && this.expandSelectedChain()) {
+            return;
+        }
+        if (kb.matches(keyData, "tui.editor.cursorLeft") && this.collapseSelectedChain()) {
+            return;
+        }
+        // Up arrow
+''',
+    '''this.expandSelectedChain()''',
+)
+
+if changed:
+    TARGET.write_text(text, "utf8")
+    print(f"wrote {TARGET}")
+else:
+    print("session selector chain collapse patch already present")

@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+# Per-Pi policy, inherited by deliberate child launches, not the login shell.
+case ${NODE_OPTIONS:-} in
+	*--max-old-space-size=8192) ;;
+	*) NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=8192" ;;
+esac
+export NODE_OPTIONS
+
+script=$0
+while [ -L "$script" ]; do
+	dir=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd)
+	target=$(readlink "$script")
+	case $target in
+		/*) script=$target ;;
+		*) script=$dir/$target ;;
+	esac
+done
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd)
+continue_requested=0
+selection_override=0
+session_dir=${PI_CODING_AGENT_SESSION_DIR:-}
+expect_session_dir=0
+options_done=0
+
+case ${1:-} in
+	install|remove|uninstall|update|list|config) selection_override=1 ;;
+esac
+
+for arg in "$@"; do
+	if [ "$options_done" = 1 ]; then
+		continue
+	fi
+	if [ "$expect_session_dir" = 1 ]; then
+		session_dir=$arg
+		expect_session_dir=0
+		continue
+	fi
+	case $arg in
+		--) options_done=1 ;;
+		-c|--continue) continue_requested=1 ;;
+		-r|--resume|--no-session|--session|--session=*|--fork|--fork=*|--session-id|--session-id=*) selection_override=1 ;;
+		--session-dir) expect_session_dir=1 ;;
+		--session-dir=*) session_dir=${arg#--session-dir=} ;;
+	esac
+done
+[ "$expect_session_dir" = 0 ] || selection_override=1
+
+if [ "$continue_requested" = 1 ] && [ "$selection_override" = 0 ] && [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+	cwd=$(pwd -P)
+	wiki_cwd=$(CDPATH= cd -- "$HOME/wiki" 2>/dev/null && pwd -P) || wiki_cwd=
+	if [ -n "$wiki_cwd" ] && [ "$cwd" = "$wiki_cwd" ]; then
+		window_title=$(tmux display-message -t "$TMUX_PANE" -p '#{window_name}' 2>/dev/null) || window_title=
+		base_title=$(tmux display-message -t "$TMUX_PANE" -p '#{@pi_title_base}' 2>/dev/null) || base_title=
+		session=
+		if [ -n "$session_dir" ]; then
+			session=$("$bin_dir/pi-resume-by-title" "$cwd" "$window_title" "$base_title" "$session_dir" 2>/dev/null) || session=
+		else
+			session=$("$bin_dir/pi-resume-by-title" "$cwd" "$window_title" "$base_title" 2>/dev/null) || session=
+		fi
+		if [ -n "$session" ]; then
+			set -- --session "$session" "$@"
+		fi
+	fi
+fi
+
+real_bin=${PI_REAL_BIN:-}
+if [ -z "$real_bin" ]; then
+	real_bin=$HOME/.local/bin/pi-ultra
+fi
+if [ ! -x "$real_bin" ]; then
+	printf '%s\n' "Pi Codex Ultra launcher is unavailable: $real_bin" >&2
+	exit 127
+fi
+
+# Forked tmux sessions must re-enter through the pre-start Ultra launcher.
+if [ -z "${PI_FORK_TMUX_LAUNCHER:-}" ]; then
+	PI_FORK_TMUX_LAUNCHER=$bin_dir/pi
+	export PI_FORK_TMUX_LAUNCHER
+fi
+
+exec "$real_bin" "$@"

@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Patch Pi to compact safely during long tool loops and recover context overflows."""
+
+from pathlib import Path
+import os
+
+CODING_AGENT_ROOT = Path(os.environ.get(
+    "PI_CODING_AGENT_ROOT",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent",
+))
+AI_ROOT = Path(os.environ.get(
+    "PI_AI_ROOT",
+    str(CODING_AGENT_ROOT / "node_modules/@earendil-works/pi-ai"),
+))
+
+TARGETS = {
+    "agent session": CODING_AGENT_ROOT / "dist/core/agent-session.js",
+    "compaction": CODING_AGENT_ROOT / "dist/core/compaction/compaction.js",
+    "overflow": AI_ROOT / "dist/utils/overflow.js",
+}
+
+texts = {name: path.read_text("utf8") for name, path in TARGETS.items()}
+changed: set[str] = set()
+
+
+def replace_once(target: str, label: str, old: str, new: str, marker: str) -> None:
+    replace_once_variant(target, label, ((old, new),), marker)
+
+
+def replace_once_variant(
+    target: str,
+    label: str,
+    variants: tuple[tuple[str, str], ...],
+    marker: str,
+) -> None:
+    text = texts[target]
+    if marker in text:
+        print(f"skip {label}: already patched")
+        return
+    matches = [(old, new) for old, new in variants if text.count(old) == 1]
+    if len(matches) != 1:
+        count = sum(text.count(old) for old, _ in variants)
+        raise RuntimeError(
+            f"{label}: expected one compatible match in {TARGETS[target]}, found {count}"
+        )
+    old, new = matches[0]
+    texts[target] = text.replace(old, new)
+    changed.add(target)
+    print(f"patched {label}")
+
+
+replace_once(
+    "overflow",
+    "reasoning-only length-stop overflow detection",
+    '''    // Case 3: Length-stop overflow (Xiaomi MiMo style) - server truncates oversized input
+    // to fit the context window, leaving no room for output. Returns stopReason "length"
+    // with output=0 and input+cacheRead filling the context window.
+    if (contextWindow && message.stopReason === "length" && message.usage.output === 0) {
+        const inputTokens = message.usage.input + message.usage.cacheRead;
+        if (inputTokens >= contextWindow * 0.99) {
+            return true;
+        }
+    }
+''',
+    '''    // Case 3: Length-stop overflow - the provider filled the context window and returned
+    // no answer text or tool call. Reasoning tokens may make usage.output non-zero even
+    // though the model had no room to produce an answer.
+    if (contextWindow && message.stopReason === "length") {
+        const hasAnswerOutput = message.content.some((part) => part.type === "toolCall" || (part.type === "text" && part.text.trim().length > 0));
+        const inputTokens = message.usage.input + message.usage.cacheRead;
+        if ((message.usage.output === 0 || !hasAnswerOutput) && inputTokens >= contextWindow * 0.99) {
+            return true;
+        }
+    }
+''',
+    "const hasAnswerOutput = message.content.some",
+)
+
+replace_once(
+    "overflow",
+    "zero-output length-stop compatibility",
+    '''        if (!hasAnswerOutput && inputTokens >= contextWindow * 0.99) {
+''',
+    '''        if ((message.usage.output === 0 || !hasAnswerOutput) && inputTokens >= contextWindow * 0.99) {
+''',
+    "(message.usage.output === 0 || !hasAnswerOutput) && inputTokens",
+)
+
+replace_once(
+    "agent session",
+    "threshold compaction failure state",
+    '''    _autoCompactionAbortController = undefined;
+    _overflowRecoveryAttempted = false;
+''',
+    '''    _autoCompactionAbortController = undefined;
+    _overflowRecoveryAttempted = false;
+    _thresholdCompactionFailedInRun = false;
+''',
+    '''_thresholdCompactionFailedInRun = false;
+    // Branch summarization state''',
+)
+
+replace_once(
+    "agent session",
+    "threshold compaction reset at agent start",
+    '''        if (event.type === "agent_start") {
+            this._turnIndex = 0;
+            await this._extensionRunner.emit({ type: "agent_start" });
+''',
+    '''        if (event.type === "agent_start") {
+            this._turnIndex = 0;
+            this._thresholdCompactionFailedInRun = false; // Allow one threshold failure in each low-level agent run.
+            await this._extensionRunner.emit({ type: "agent_start" });
+''',
+    '''this._thresholdCompactionFailedInRun = false; // Allow one threshold failure in each low-level agent run.''',
+)
+
+replace_once(
+    "agent session",
+    "threshold compaction reset after run",
+    '''    async _emitAgentSettled() {
+        this._isAgentRunActive = false;
+        try {
+''',
+    '''    async _emitAgentSettled() {
+        this._isAgentRunActive = false;
+        this._thresholdCompactionFailedInRun = false; // Let the next prompt's preflight try compaction again.
+        try {
+''',
+    '''this._thresholdCompactionFailedInRun = false; // Let the next prompt's preflight try compaction again.''',
+)
+
+replace_once(
+    "agent session",
+    "length-stop recovery attempt guard",
+    '''                if (assistantMsg.stopReason !== "error") {
+                    this._overflowRecoveryAttempted = false;
+                }
+''',
+    '''                if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length") {
+                    this._overflowRecoveryAttempted = false;
+                }
+''',
+    'assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "length"',
+)
+
+if "isRecoverableLength(assistantMessage" in texts["agent session"]:
+    replace_once(
+        "agent session",
+        "reasoning-only recoverable length stop",
+        '''        const recoverableLength = sameModel && isRecoverableLength(assistantMessage, this.model?.maxTokens ?? 0);
+''',
+        '''        const hasAnswerOutput = assistantMessage.content.some((part) => part.type === "toolCall" || (part.type === "text" && part.text.trim().length > 0));
+        const recoverableLength = !hasAnswerOutput && sameModel && isRecoverableLength(assistantMessage, this.model?.maxTokens ?? 0);
+''',
+        "const recoverableLength = !hasAnswerOutput && sameModel",
+    )
+else:
+    print("skip reasoning-only recoverable length stop: upstream feature absent")
+
+replace_once(
+    "agent session",
+    "between-tool-turn compaction",
+    '''        this.agent.prepareNextTurnWithContext = async (turn, signal) => {
+            const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
+            const previousContext = previousSnapshot?.context ?? turn.context;
+            return {
+''',
+    '''        this.agent.prepareNextTurnWithContext = async (turn, signal) => {
+            const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
+            let previousContext = previousSnapshot?.context ?? turn.context;
+            const completedToolTurn = turn.toolResults.length > 0 && turn.message.content.some((part) => part.type === "toolCall");
+            if (completedToolTurn && (await this._checkCompaction(turn.message, true, true))) {
+                previousContext = {
+                    ...previousContext,
+                    messages: this.agent.state.messages.slice(),
+                };
+            }
+            return {
+''',
+    "const completedToolTurn = turn.toolResults.length > 0",
+)
+
+replace_once(
+    "agent session",
+    "threshold retry argument",
+    '''    async _checkCompaction(assistantMessage, skipAbortedCheck = true) {
+''',
+    '''    async _checkCompaction(assistantMessage, skipAbortedCheck = true, thresholdWillRetry = false) {
+''',
+    "async _checkCompaction(assistantMessage, skipAbortedCheck = true, thresholdWillRetry = false)",
+)
+
+replace_once(
+    "agent session",
+    "trailing tool-result token estimate",
+    '''        if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
+            const messages = this.agent.state.messages;
+            const estimate = estimateContextTokens(messages);
+''',
+    '''        if (thresholdWillRetry) {
+            const estimate = estimateContextTokens(this.agent.state.messages);
+            contextTokens = estimate.lastUsageIndex === null ? directContextTokens : estimate.tokens;
+        }
+        else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
+            const messages = this.agent.state.messages;
+            const estimate = estimateContextTokens(messages);
+''',
+    "const estimate = estimateContextTokens(this.agent.state.messages);",
+)
+
+replace_once(
+    "agent session",
+    "active threshold continuation",
+    '''            return await this._runAutoCompaction("threshold", false);
+''',
+    '''            return await this._runAutoCompaction("threshold", thresholdWillRetry);
+''',
+    'return await this._runAutoCompaction("threshold", thresholdWillRetry);',
+)
+
+replace_once(
+    "agent session",
+    "failed threshold compaction guard",
+    '''        if (shouldCompact(contextTokens, contextWindow, settings)) {
+            return await this._runAutoCompaction("threshold", thresholdWillRetry);
+        }
+''',
+    '''        if (shouldCompact(contextTokens, contextWindow, settings)) {
+            if (this._thresholdCompactionFailedInRun)
+                return false;
+            return await this._runAutoCompaction("threshold", thresholdWillRetry);
+        }
+''',
+    '''if (this._thresholdCompactionFailedInRun)
+                return false;''',
+)
+
+replace_once_variant(
+    "agent session",
+    "threshold compaction success state",
+    (
+        (
+            '''        const settings = this.settingsManager.getCompactionSettings();
+        let started = false;
+        try {
+''',
+            '''        const settings = this.settingsManager.getCompactionSettings();
+        let started = false;
+        let thresholdCompactionSucceeded = false;
+        try {
+''',
+        ),
+        (
+            '''        const settings = this.settingsManager.getCompactionSettings();
+        let started = false;
+        let fromExtension = false;
+        try {
+''',
+            '''        const settings = this.settingsManager.getCompactionSettings();
+        let started = false;
+        let fromExtension = false;
+        let thresholdCompactionSucceeded = false;
+        try {
+''',
+        ),
+    ),
+    '''let thresholdCompactionSucceeded = false;''',
+)
+
+replace_once_variant(
+    "agent session",
+    "overflow fallback after extension cancellation",
+    (
+        (
+            '''                if (extensionResult?.cancel) {
+                    this._emit({
+                        type: "compaction_end",
+                        reason,
+                        result: undefined,
+                        aborted: true,
+                        willRetry: false,
+                    });
+                    return false;
+                }
+                if (extensionResult?.compaction) {
+''',
+            '''                // Provider-declared overflow has no usable answer to preserve. If a custom
+                // compactor cannot run, fall back to core compaction rather than stopping on the
+                // provider error. Explicit abort signals and all non-overflow cancellations remain final.
+                if (extensionResult?.cancel &&
+                    (reason !== "overflow" || !willRetry || this._autoCompactionAbortController.signal.aborted)) {
+                    this._emit({
+                        type: "compaction_end",
+                        reason,
+                        result: undefined,
+                        aborted: true,
+                        willRetry: false,
+                    });
+                    return false;
+                }
+                if (!extensionResult?.cancel && extensionResult?.compaction) {
+''',
+        ),
+        (
+            '''                if (extensionResult?.cancel) {
+                    this._emit({
+                        type: "compaction_end",
+                        reason,
+                        result: undefined,
+                        aborted: true,
+                        willRetry: false,
+                    });
+                    await this._emitSessionCompactFailed({
+                        reason,
+                        aborted: true,
+                        willRetry: false,
+                        fromExtension: false,
+                    });
+                    return false;
+                }
+                if (extensionResult?.compaction) {
+''',
+            '''                // Provider-declared overflow has no usable answer to preserve. If a custom
+                // compactor cannot run, fall back to core compaction rather than stopping on the
+                // provider error. Explicit abort signals and all non-overflow cancellations remain final.
+                if (extensionResult?.cancel &&
+                    (reason !== "overflow" || !willRetry || this._autoCompactionAbortController.signal.aborted)) {
+                    this._emit({
+                        type: "compaction_end",
+                        reason,
+                        result: undefined,
+                        aborted: true,
+                        willRetry: false,
+                    });
+                    await this._emitSessionCompactFailed({
+                        reason,
+                        aborted: true,
+                        willRetry: false,
+                        fromExtension: false,
+                    });
+                    return false;
+                }
+                if (!extensionResult?.cancel && extensionResult?.compaction) {
+''',
+        ),
+    ),
+    '''if (extensionResult?.cancel &&
+                    (reason !== "overflow" || !willRetry || this._autoCompactionAbortController.signal.aborted)) {''',
+)
+
+replace_once_variant(
+    "agent session",
+    "successful threshold compaction state",
+    (
+        (
+            '''            if (this._autoCompactionAbortController.signal.aborted) {
+                this._emit({
+                    type: "compaction_end",
+                    reason,
+                    result: undefined,
+                    aborted: true,
+                    willRetry: false,
+                });
+                return false;
+            }
+            this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+            const newEntries = this.sessionManager.getEntries();
+''',
+            '''            if (this._autoCompactionAbortController.signal.aborted) {
+                this._emit({
+                    type: "compaction_end",
+                    reason,
+                    result: undefined,
+                    aborted: true,
+                    willRetry: false,
+                });
+                return false;
+            }
+            this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+            thresholdCompactionSucceeded = true;
+            const newEntries = this.sessionManager.getEntries();
+''',
+        ),
+        (
+            '''            if (this._autoCompactionAbortController.signal.aborted) {
+                this._emit({
+                    type: "compaction_end",
+                    reason,
+                    result: undefined,
+                    aborted: true,
+                    willRetry: false,
+                });
+                await this._emitSessionCompactFailed({
+                    reason,
+                    aborted: true,
+                    willRetry: false,
+                    fromExtension,
+                });
+                return false;
+            }
+            this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+            const newEntries = this.sessionManager.getEntries();
+''',
+            '''            if (this._autoCompactionAbortController.signal.aborted) {
+                this._emit({
+                    type: "compaction_end",
+                    reason,
+                    result: undefined,
+                    aborted: true,
+                    willRetry: false,
+                });
+                await this._emitSessionCompactFailed({
+                    reason,
+                    aborted: true,
+                    willRetry: false,
+                    fromExtension,
+                });
+                return false;
+            }
+            this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+            thresholdCompactionSucceeded = true;
+            const newEntries = this.sessionManager.getEntries();
+''',
+        ),
+    ),
+    '''this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+            thresholdCompactionSucceeded = true;''',
+)
+
+replace_once(
+    "agent session",
+    "failed threshold compaction state",
+    '''        finally {
+            this._autoCompactionAbortController = undefined;
+        }
+''',
+    '''        finally {
+            if (reason === "threshold" && !thresholdCompactionSucceeded)
+                this._thresholdCompactionFailedInRun = true;
+            this._autoCompactionAbortController = undefined;
+        }
+''',
+    '''if (reason === "threshold" && !thresholdCompactionSucceeded)
+                this._thresholdCompactionFailedInRun = true;''',
+)
+
+replace_once(
+    "agent session",
+    "length-stop retry cleanup after compaction",
+    '''                if (lastMsg?.role === "assistant" && lastMsg.stopReason === "error") {
+                    this.agent.state.messages = messages.slice(0, -1);
+                }
+''',
+    '''                if (lastMsg?.role === "assistant" && (lastMsg.stopReason === "error" || lastMsg.stopReason === "length")) {
+                    this.agent.state.messages = messages.slice(0, -1);
+                }
+''',
+    'lastMsg.stopReason === "error" || lastMsg.stopReason === "length"',
+)
+
+replace_once(
+    "compaction",
+    "oversized trailing tool-result cut point",
+    '''            // Find the closest valid cut point at or after this entry
+            for (let c = 0; c < cutPoints.length; c++) {
+                if (cutPoints[c] >= i) {
+                    cutIndex = cutPoints[c];
+                    break;
+                }
+            }
+''',
+    '''            // Find the closest valid cut point at or after this entry. If the newest
+            // entry is a tool result, keep its preceding assistant tool call too.
+            cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+''',
+    "cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1]",
+)
+
+for name in changed:
+    TARGETS[name].write_text(texts[name], "utf8")
+    print(f"wrote {TARGETS[name]}")
+
+if changed:
+    print("active compaction patch applied; restart Pi to load it")
+else:
+    print("active compaction patch already present")

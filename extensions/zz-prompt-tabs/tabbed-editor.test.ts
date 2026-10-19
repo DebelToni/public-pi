@@ -11,7 +11,12 @@ function createEditor(
 	let renders = 0;
 	const footerUpdates: Array<string | undefined> = [];
 	const stateUpdates: Array<{ texts: string[]; activeIndex: number }> = [];
+	const criticalUpdates: Array<{
+		snapshot: { texts: string[]; activeIndex: number };
+		closedTabs: Array<{ text: string; closedAt: number; index: number; wasOnlyTab: boolean }>;
+	}> = [];
 	const submissionErrors: unknown[] = [];
+	let criticalStateAccepted = true;
 	const tui = {
 		terminal: { rows: 40 },
 		requestRender: () => { renders++; },
@@ -32,7 +37,8 @@ function createEditor(
 			return (data === "FOLLOW" && action === "app.message.followUp")
 				|| (data === "DEQUEUE" && action === "app.message.dequeue")
 				|| (data === "ESC" && action === "app.interrupt")
-				|| (data === "EXIT" && action === "app.exit");
+				|| (data === "EXIT" && action === "app.exit")
+				|| (data === "CLEAR" && action === "app.clear");
 		},
 		getKeys() { return []; },
 	} as unknown as KeybindingsManager;
@@ -42,6 +48,11 @@ function createEditor(
 		recall: (text) => text.split("\n\n"),
 		onFooterChange: (text) => footerUpdates.push(text),
 		onStateChange: (snapshot) => stateUpdates.push(structuredClone(snapshot)),
+		commitCriticalState: (snapshot, closedTabs) => {
+			if (!criticalStateAccepted) return false;
+			criticalUpdates.push({ snapshot: structuredClone(snapshot), closedTabs: structuredClone(closedTabs) });
+			return true;
+		},
 		onSubmitError: (error) => submissionErrors.push(error),
 	});
 	return {
@@ -50,9 +61,30 @@ function createEditor(
 		get renders() { return renders; },
 		footerUpdates,
 		stateUpdates,
+		criticalUpdates,
+		setCriticalStateAccepted(value: boolean) { criticalStateAccepted = value; },
 		submissionErrors,
 	};
 }
+
+test("external text updates repaint the terminal and publish durable draft state without another keypress", () => {
+	const harness = createEditor();
+	const before = harness.renders;
+	harness.editor.setText("Phone draft appears immediately");
+	assert.ok(harness.renders > before);
+	assert.deepEqual(harness.stateUpdates.at(-1), { texts: ["Phone draft appears immediately"], activeIndex: 0 });
+});
+
+test("direct phone tab selection preserves the first subsequent text edit", () => {
+	const { editor } = createEditor();
+	editor.setText("first");
+	editor.newDraft("second");
+	editor.selectDraft(0);
+	editor.setText("edited first");
+	editor.selectDraft(1);
+	editor.setText("edited second");
+	assert.deepEqual(editor.getSnapshot(), { texts: ["edited first", "edited second"], activeIndex: 1 });
+});
 
 test("draft tabs preserve a previously configured CustomEditor", () => {
 	class StyledEditor extends CustomEditor {
@@ -87,12 +119,11 @@ test("prompt text made entirely of border characters remains visible", () => {
 	assert.match(rendered.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""), /─{19}/);
 });
 
-test("returning to one draft clears the footer tab indicator", () => {
+test("closing the second draft clears the footer tab indicator", () => {
 	const harness = createEditor();
-	harness.editor.onSubmit = () => {};
 	harness.editor.setText("keep");
-	harness.editor.newDraft("send");
-	harness.editor.handleInput("\r");
+	harness.editor.newDraft("close");
+	harness.editor.closeCurrentDraft();
 	assert.equal(harness.footerUpdates.at(-1), undefined);
 });
 
@@ -135,15 +166,82 @@ test("closing removes the active draft and activates its neighbor", () => {
 	assert.match(harness.footerUpdates.at(-1) ?? "", /^prompts 2\/2/);
 });
 
-test("closing the sole draft clears it and keeps one editor tab", () => {
+test("closing the sole draft archives it and keeps one empty editor tab", () => {
 	const harness = createEditor();
 	harness.editor.setText("discard me");
-	harness.editor.closeCurrentDraft();
+	assert.equal(harness.editor.closeCurrentDraft(), true);
 	assert.deepEqual(harness.editor.getDraftTexts(), [""]);
+	assert.equal(harness.editor.getClosedTabs()[0]?.text, "discard me");
 	assert.equal(harness.footerUpdates.at(-1), undefined);
 });
 
-test("one-shot submission uses normal submit handling and pops only its draft", () => {
+test("restoring a closed middle tab returns it to its original position and selects it", () => {
+	const harness = createEditor();
+	const { editor } = harness;
+	editor.setText("first");
+	editor.newDraft("second");
+	editor.newDraft("third");
+	editor.previousDraft();
+	editor.closeCurrentDraft();
+	assert.deepEqual(editor.getSnapshot(), { texts: ["first", "third"], activeIndex: 1 });
+	assert.equal(editor.restoreClosedDraft(), true);
+	assert.deepEqual(editor.getSnapshot(), { texts: ["first", "second", "third"], activeIndex: 1 });
+	assert.deepEqual(editor.getClosedTabs(), []);
+});
+
+test("closed tabs restore newest first without losing older archived tabs", () => {
+	const { editor } = createEditor();
+	editor.setText("first");
+	editor.newDraft("second");
+	editor.closeCurrentDraft();
+	editor.closeCurrentDraft();
+	assert.deepEqual(editor.getClosedTabs().map((tab) => tab.text), ["second", "first"]);
+	editor.restoreClosedDraft();
+	assert.equal(editor.getText(), "first");
+	assert.deepEqual(editor.getClosedTabs().map((tab) => tab.text), ["second"]);
+	editor.restoreClosedDraft();
+	assert.deepEqual(editor.getDraftTexts(), ["first", "second"]);
+	assert.deepEqual(editor.getClosedTabs(), []);
+});
+
+test("legacy Option+Shift+T restores the newest closed tab", () => {
+	const { editor } = createEditor();
+	editor.setText("recover through tmux");
+	editor.closeCurrentDraft();
+	editor.handleInput("\x1bT");
+	assert.deepEqual(editor.getSnapshot(), { texts: ["recover through tmux"], activeIndex: 0 });
+	assert.deepEqual(editor.getClosedTabs(), []);
+});
+
+test("closing an empty tab does not archive it", () => {
+	const { editor } = createEditor();
+	editor.newDraft();
+	editor.closeCurrentDraft();
+	assert.deepEqual(editor.getClosedTabs(), []);
+	assert.equal(editor.restoreClosedDraft(), false);
+});
+
+test("a failed archive write refuses to close the non-empty tab", () => {
+	const harness = createEditor();
+	harness.editor.setText("must survive");
+	harness.setCriticalStateAccepted(false);
+	assert.equal(harness.editor.closeCurrentDraft(), false);
+	assert.deepEqual(harness.editor.getSnapshot(), { texts: ["must survive"], activeIndex: 0 });
+	assert.deepEqual(harness.editor.getClosedTabs(), []);
+});
+
+test("a failed restoration write leaves the archive and open tabs unchanged", () => {
+	const harness = createEditor();
+	harness.editor.setText("closed prompt");
+	harness.editor.closeCurrentDraft();
+	harness.editor.setText("current prompt");
+	harness.setCriticalStateAccepted(false);
+	assert.equal(harness.editor.restoreClosedDraft(), false);
+	assert.deepEqual(harness.editor.getSnapshot(), { texts: ["current prompt"], activeIndex: 0 });
+	assert.deepEqual(harness.editor.getClosedTabs().map((tab) => tab.text), ["closed prompt"]);
+});
+
+test("one-shot submission keeps its selected tab and clears only that draft", () => {
 	const { editor } = createEditor();
 	const submitted: string[] = [];
 	editor.onSubmit = (text) => submitted.push(text);
@@ -151,11 +249,12 @@ test("one-shot submission uses normal submit handling and pops only its draft", 
 	editor.newDraft("  send once  ");
 	assert.equal(editor.submitCurrentDraft(), true);
 	assert.deepEqual(submitted, ["send once"]);
-	assert.deepEqual(editor.getDraftTexts(), ["keep"]);
-	assert.equal(editor.getText(), "keep");
+	assert.deepEqual(editor.getDraftTexts(), ["keep", ""]);
+	assert.equal(editor.getActiveIndex(), 1);
+	assert.equal(editor.getText(), "");
 });
 
-test("submission persists only the accepted post-pop state", () => {
+test("submission persists the selected empty tab", () => {
 	const harness = createEditor();
 	const { editor } = harness;
 	editor.onSubmit = () => {};
@@ -163,7 +262,7 @@ test("submission persists only the accepted post-pop state", () => {
 	editor.newDraft("send");
 	harness.stateUpdates.length = 0;
 	editor.handleInput("\r");
-	assert.deepEqual(harness.stateUpdates, [{ texts: ["keep"], activeIndex: 0 }]);
+	assert.deepEqual(harness.stateUpdates, [{ texts: ["keep", ""], activeIndex: 1 }]);
 });
 
 test("a synchronously failed submission restores and retains the draft", () => {
@@ -186,18 +285,31 @@ test("an asynchronously rejected submission restores its draft without erasing l
 	editor.newDraft("keep");
 	editor.previousDraft();
 	editor.handleInput("\r");
-	assert.deepEqual(editor.getDraftTexts(), ["keep"]);
+	assert.deepEqual(editor.getDraftTexts(), ["", "keep"]);
 	editor.setText("edited while pending");
 	reject(new Error("async rejection"));
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.deepEqual(editor.getSnapshot(), {
-		texts: ["submit me", "edited while pending"],
+		texts: ["submit me", "edited while pending", "keep"],
 		activeIndex: 0,
 	});
 	assert.match(String(harness.submissionErrors[0]), /async rejection/);
 });
 
-test("submitting pops only the active draft", () => {
+test("submitting a middle tab keeps its position, selection, and neighboring drafts", () => {
+	const { editor } = createEditor();
+	const submitted: string[] = [];
+	editor.onSubmit = (text) => submitted.push(text);
+	editor.setText("first");
+	editor.newDraft("second");
+	editor.newDraft("third");
+	editor.previousDraft();
+	editor.handleInput("\r");
+	assert.deepEqual(submitted, ["second"]);
+	assert.deepEqual(editor.getSnapshot(), { texts: ["first", "", "third"], activeIndex: 1 });
+});
+
+test("submitting tab one keeps an empty selected tab one", () => {
 	const { editor } = createEditor();
 	const submitted: string[] = [];
 	editor.onSubmit = (text) => submitted.push(text);
@@ -206,8 +318,9 @@ test("submitting pops only the active draft", () => {
 	editor.previousDraft();
 	editor.handleInput("\r");
 	assert.deepEqual(submitted, ["first"]);
-	assert.deepEqual(editor.getDraftTexts(), ["second"]);
-	assert.equal(editor.getText(), "second");
+	assert.deepEqual(editor.getDraftTexts(), ["", "second"]);
+	assert.equal(editor.getActiveIndex(), 0);
+	assert.equal(editor.getText(), "");
 });
 
 test("late async editor clears stay bound to the submitted draft", async () => {
@@ -222,12 +335,13 @@ test("late async editor clears stay bound to the submitted draft", async () => {
 	editor.newDraft("third");
 	editor.nextDraft();
 	editor.handleInput("\r");
-	assert.deepEqual(editor.getDraftTexts(), ["second", "third"]);
+	assert.deepEqual(editor.getDraftTexts(), ["", "second", "third"]);
+	editor.nextDraft();
 	editor.nextDraft();
 	assert.equal(editor.getText(), "third");
 	release();
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	assert.deepEqual(editor.getDraftTexts(), ["second", "third"]);
+	assert.deepEqual(editor.getDraftTexts(), ["", "second", "third"]);
 	assert.equal(editor.getText(), "third");
 });
 
@@ -246,7 +360,7 @@ test("late async clears cannot erase a replacement sole-tab draft", async () => 
 	assert.equal(editor.getText(), "new prompt");
 });
 
-test("follow-up key submits directly and pops the active draft while idle", () => {
+test("follow-up key keeps an empty selected tab while idle", () => {
 	const { editor } = createEditor();
 	const submitted: string[] = [];
 	editor.onSubmit = (text) => submitted.push(text);
@@ -254,10 +368,11 @@ test("follow-up key submits directly and pops the active draft while idle", () =
 	editor.newDraft("send now");
 	editor.handleInput("FOLLOW");
 	assert.deepEqual(submitted, ["send now"]);
-	assert.deepEqual(editor.getDraftTexts(), ["keep"]);
+	assert.deepEqual(editor.getDraftTexts(), ["keep", ""]);
+	assert.equal(editor.getActiveIndex(), 1);
 });
 
-test("follow-up submission pops the active draft while busy", () => {
+test("queued follow-up keeps an empty selected tab while busy", () => {
 	const harness = createEditor();
 	const { editor } = harness;
 	harness.setIdle(false);
@@ -270,8 +385,34 @@ test("follow-up submission pops the active draft while busy", () => {
 	editor.newDraft("follow up");
 	editor.handleInput("FOLLOW");
 	assert.deepEqual(queued, ["follow up"]);
-	assert.deepEqual(editor.getDraftTexts(), ["keep"]);
-	assert.equal(editor.getText(), "keep");
+	assert.deepEqual(editor.getDraftTexts(), ["keep", ""]);
+	assert.equal(editor.getActiveIndex(), 1);
+	assert.equal(editor.getText(), "");
+});
+
+test("Ctrl+C arms and then exits without clearing the active draft", () => {
+	const harness = createEditor();
+	const { editor } = harness;
+	let clearInvocations = 0;
+	let exits = 0;
+	editor.onAction("app.clear", () => {
+		clearInvocations++;
+		if (clearInvocations === 1) editor.setText("");
+		else exits++;
+	});
+	editor.setText("preserve this prompt");
+	harness.stateUpdates.length = 0;
+
+	editor.handleInput("CLEAR");
+	assert.equal(editor.getText(), "preserve this prompt");
+	assert.equal(clearInvocations, 1);
+	assert.deepEqual(harness.stateUpdates, []);
+
+	editor.handleInput("CLEAR");
+	assert.equal(editor.getText(), "preserve this prompt");
+	assert.equal(clearInvocations, 2);
+	assert.equal(exits, 1);
+	assert.deepEqual(editor.getSnapshot(), { texts: ["preserve this prompt"], activeIndex: 0 });
 });
 
 test("Ctrl+D moves to a non-empty draft instead of exiting", () => {

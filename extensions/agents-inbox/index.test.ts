@@ -13,7 +13,7 @@ function message(id: string, parentId: string | null, value: any) {
 }
 
 function assistant(content: any[], stopReason: string) {
-	return { role: "assistant", content, stopReason, timestamp: Date.now(), provider: "codex-pro", model: "gpt-5.6-sol" };
+	return { role: "assistant", content, stopReason, timestamp: Date.now(), provider: "codex-pro", model: "gpt-6-sol" };
 }
 
 function pane(overrides: Partial<TmuxAgentPane> = {}): TmuxAgentPane {
@@ -199,9 +199,11 @@ describe("agents inbox", () => {
 		expect(result).toEqual({ category: "attention", status: "command exceeded its timeout" });
 	});
 
-	test("parses consistent Luna JSON and rejects ordinary work labeled attention", () => {
+	test("parses consistent Luna JSON and rejects contradictory categories", () => {
 		expect(parseClassification('```json\n{"category":"needs attention","basis":"waiting","status":"Waiting for database choice, please."}\n```'))
 			.toEqual({ category: "attention", basis: "waiting", status: "waiting for database choice please" });
+		expect(parseClassification('{"category":"ready","basis":"finished","status":"blocked by offline underleaf"}'))
+			.toEqual({ category: "attention", basis: "waiting", status: "blocked by offline underleaf" });
 		expect(parseClassification('{"category":"attention","basis":"stuck","status":"subagents auditing repository files"}'))
 			.toBeUndefined();
 		expect(parseClassification('{"category":"attention","basis":"stuck","status":"subagent read appears stuck"}'))

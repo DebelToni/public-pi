@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Resolve the newest current-directory Pi session matching a tmux title."""
+
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Optional, Union
+
+STATE_PREFIXES = ("○ ", "● ", "✓ ")
+
+
+def normalized_path(value: str) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(value)))
+
+
+def title_from_window(window_title: str, base_title: str = "") -> str:
+    window_title = window_title.strip()
+    base_title = base_title.strip()
+    if base_title and (
+        window_title == base_title
+        or any(window_title == f"{prefix}{base_title}" for prefix in STATE_PREFIXES)
+    ):
+        return base_title
+    for prefix in STATE_PREFIXES:
+        if window_title.startswith(prefix):
+            return window_title[len(prefix):].strip()
+    return window_title
+
+
+def default_session_dir(cwd: str, agent_dir: Path) -> Path:
+    resolved_cwd = str(normalized_path(cwd))
+    encoded = resolved_cwd.lstrip("/\\").replace("/", "-").replace("\\", "-").replace(":", "-")
+    return agent_dir / "sessions" / f"--{encoded}--"
+
+
+def resolve_session(
+    cwd: str,
+    window_title: str,
+    base_title: str = "",
+    session_dir: Optional[str] = None,
+    agent_dir: Optional[Union[str, Path]] = None,
+) -> Optional[Path]:
+    name = title_from_window(window_title, base_title)
+    if not name:
+        return None
+
+    resolved_cwd = normalized_path(cwd)
+    resolved_agent_dir = normalized_path(str(agent_dir or os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")))
+    resolved_session_dir = normalized_path(session_dir) if session_dir else default_session_dir(cwd, resolved_agent_dir)
+
+    try:
+        data = json.loads((resolved_agent_dir / "wiki-session-titles.json").read_text("utf8"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+    candidates: dict[str, dict] = {}
+    sessions = data.get("sessions")
+    if isinstance(sessions, dict):
+        for path, metadata in sessions.items():
+            if isinstance(path, str) and isinstance(metadata, dict):
+                candidates[path] = metadata
+
+    titles = data.get("titles")
+    legacy = titles.get(name) if isinstance(titles, dict) else None
+    if isinstance(legacy, dict) and isinstance(legacy.get("session"), str):
+        candidates.setdefault(legacy["session"], {**legacy, "title": name})
+
+    matches: list[tuple[int, int, str, Path]] = []
+    for path, metadata in candidates.items():
+        if metadata.get("title") != name:
+            continue
+        mapped_cwd = metadata.get("cwd")
+        if not isinstance(mapped_cwd, str) or normalized_path(mapped_cwd) != resolved_cwd:
+            continue
+        candidate = normalized_path(path)
+        if candidate.suffix != ".jsonl" or candidate.parent != resolved_session_dir:
+            continue
+        try:
+            stats = candidate.stat()
+        except OSError:
+            continue
+        if not candidate.is_file():
+            continue
+        updated_at = metadata.get("updatedAt")
+        updated = int(updated_at) if isinstance(updated_at, (int, float)) else 0
+        matches.append((stats.st_mtime_ns, updated, candidate.name, candidate))
+
+    return max(matches)[3] if matches else None
+
+
+def main() -> int:
+    if len(sys.argv) not in (3, 4, 5):
+        print(f"usage: {Path(sys.argv[0]).name} <cwd> <window-title> [base-title] [session-dir]", file=sys.stderr)
+        return 2
+    session = resolve_session(
+        sys.argv[1],
+        sys.argv[2],
+        sys.argv[3] if len(sys.argv) >= 4 else "",
+        sys.argv[4] if len(sys.argv) == 5 and sys.argv[4] else None,
+    )
+    if not session:
+        return 1
+    print(session)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

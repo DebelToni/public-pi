@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+import tempfile
+from typing import Optional
+
+ROOT = Path(os.environ.get("PI_CODING_AGENT_ROOT", "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent"))
+AGENT_DIR = Path(os.environ.get("PI_AGENT_DIR", Path.home() / ".pi" / "agent"))
+RUNTIME_CLIENT_SOURCE = Path(os.environ.get("PI_SESSION_CATALOG_CLIENT_SOURCE", AGENT_DIR / "lib/session-catalog/runtime-client.mjs"))
+RUNTIME_CLIENT = Path(os.environ.get("PI_SESSION_CATALOG_CLIENT_PATH", ROOT / "dist/core/session-catalog-client.js"))
+SELECTOR = Path(os.environ.get("PI_SESSION_SELECTOR_PATH", ROOT / "dist/modes/interactive/components/session-selector.js"))
+SELECTOR_TYPES = Path(os.environ.get("PI_SESSION_SELECTOR_TYPES_PATH", ROOT / "dist/modes/interactive/components/session-selector.d.ts"))
+PICKER = Path(os.environ.get("PI_SESSION_PICKER_PATH", ROOT / "dist/cli/session-picker.js"))
+PICKER_TYPES = Path(os.environ.get("PI_SESSION_PICKER_TYPES_PATH", ROOT / "dist/cli/session-picker.d.ts"))
+INTERACTIVE = Path(os.environ.get("PI_INTERACTIVE_MODE_PATH", ROOT / "dist/modes/interactive/interactive-mode.js"))
+MAIN = Path(os.environ.get("PI_MAIN_PATH", ROOT / "dist/main.js"))
+
+paths = (SELECTOR, SELECTOR_TYPES, PICKER, PICKER_TYPES, INTERACTIVE, MAIN)
+texts = {path: path.read_text("utf8") for path in paths}
+runtime_text = RUNTIME_CLIENT_SOURCE.read_text("utf8")
+changed_paths = set()
+
+
+def replace_once(path: Path, label: str, old: str, new: str, marker: Optional[str] = None):
+    text = texts[path]
+    if marker and marker in text:
+        print(f"skip {path.name} {label}: already patched")
+        return
+    count = text.count(old)
+    if count == 0 and new in text:
+        print(f"skip {path.name} {label}: already patched")
+        return
+    if count != 1:
+        raise RuntimeError(f"{path} {label}: expected one match, found {count}")
+    texts[path] = text.replace(old, new)
+    changed_paths.add(path)
+    print(f"patched {path.name} {label}")
+
+
+def replace_if_present(path, label, old, new):
+    if old not in texts[path]:
+        return
+    if texts[path].count(old) != 1:
+        raise SystemExit(f"expected exactly one {label} block in {path}, found {texts[path].count(old)}")
+    texts[path] = texts[path].replace(old, new, 1)
+    changed_paths.add(path)
+    print(f"patched {path.name} {label}")
+
+
+replace_once(
+    SELECTOR,
+    "catalog-aware header",
+    '''    showRenameHint = false;
+    constructor(scope, sortMode, nameFilter, requestRender) {
+        this.scope = scope;
+        this.sortMode = sortMode;
+        this.nameFilter = nameFilter;
+        this.requestRender = requestRender;
+    }
+''',
+    '''    showRenameHint = false;
+    catalogSearch = false;
+    constructor(scope, sortMode, nameFilter, requestRender, catalogSearch = false) {
+        this.scope = scope;
+        this.sortMode = sortMode;
+        this.nameFilter = nameFilter;
+        this.requestRender = requestRender;
+        this.catalogSearch = catalogSearch;
+    }
+''',
+    '''catalogSearch = false;''',
+)
+
+replace_once(
+    SELECTOR,
+    "BM25 sort label",
+    '''        const sortLabel = this.sortMode === "threaded" ? "Threaded" : this.sortMode === "recent" ? "Recent" : "Fuzzy";''',
+    '''        const sortLabel = this.sortMode === "threaded" ? "Threaded" : this.sortMode === "recent" ? "Recent" : this.catalogSearch ? "BM25" : "Fuzzy";''',
+    '''this.catalogSearch ? "BM25"''',
+)
+
+replace_if_present(
+    SELECTOR,
+    "expand legacy fuzzy search hint",
+    '''            const hint1 = keyHint("tui.input.tab", "scope") + sep + theme.fg("muted", 'fz:<text> legacy fuzzy · re:<pattern> regex · "phrase" exact');''',
+    '''            const hint1 = keyHint("tui.input.tab", "scope") + sep + theme.fg("muted", 'fuzzy:<text> legacy · re:<pattern> regex · "phrase" exact');''',
+)
+
+replace_once(
+    SELECTOR,
+    "legacy fuzzy search hint",
+    '''            const hint1 = keyHint("tui.input.tab", "scope") + sep + theme.fg("muted", 're:<pattern> regex · "phrase" exact');''',
+    '''            const hint1 = keyHint("tui.input.tab", "scope") + sep + theme.fg("muted", 'fuzzy:<text> legacy · re:<pattern> regex · "phrase" exact');''',
+    '''fuzzy:<text> legacy''',
+)
+
+replace_once(
+    SELECTOR,
+    "session-list search state",
+    '''    confirmingDeletePath = null;
+    expandedChains = new Set();
+    currentSessionCanonicalPath;
+    onSelect;
+''',
+    '''    confirmingDeletePath = null;
+    expandedChains = new Set();
+    currentSessionCanonicalPath;
+    externalSearch = null;
+    onSearchQuery;
+    onSelect;
+''',
+    '''externalSearch = null;''',
+)
+
+replace_once(
+    SELECTOR,
+    "external catalog search results",
+    '''    setSessions(sessions, showCwd) {
+        const selectedPath = this.getSelectedSessionPath();
+        this.allSessions = sessions;
+        this.showCwd = showCwd;
+        this.filterSessions(this.searchInput.getValue());
+        if (selectedPath)
+            this.selectSessionPath(selectedPath);
+    }
+    filterSessions(query) {
+        const trimmed = query.trim();
+        const nameFiltered = this.nameFilter === "all" ? this.allSessions : this.allSessions.filter((session) => hasSessionName(session));
+        if (this.sortMode === "threaded" && !trimmed) {
+            // Threaded mode without search: show tree structure
+            const roots = buildSessionTree(nameFiltered);
+            this.filteredSessions = flattenSessionTree(roots, this.expandedChains);
+        }
+        else {
+            // Other modes or with search: flat list
+            const filtered = filterAndSortSessions(nameFiltered, query, this.sortMode, "all");
+            this.filteredSessions = filtered.map((session) => ({
+                session,
+                displayModified: getOwnModified(session),
+                depth: 0,
+                isLast: true,
+                ancestorContinues: [],
+                collapsedAncestors: 0,
+            }));
+        }
+        this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
+    }
+''',
+    '''    setSessions(sessions, showCwd) {
+        const selectedPath = this.getSelectedSessionPath();
+        this.allSessions = sessions;
+        this.showCwd = showCwd;
+        this.filterSessions(this.searchInput.getValue());
+        if (selectedPath)
+            this.selectSessionPath(selectedPath);
+    }
+    getSearchQuery() {
+        return this.searchInput.getValue().trim();
+    }
+    clearSearchResults() {
+        this.externalSearch = null;
+        this.filterSessions(this.searchInput.getValue());
+    }
+    setSearchResults(query, sessions) {
+        const trimmed = query.trim();
+        if (!trimmed || this.getSearchQuery() !== trimmed)
+            return;
+        const selectedPath = this.getSelectedSessionPath();
+        this.externalSearch = { query: trimmed, sessions };
+        this.filterSessions(trimmed);
+        if (selectedPath)
+            this.selectSessionPath(selectedPath);
+    }
+    filterSessions(query) {
+        const trimmed = query.trim();
+        const external = trimmed && this.externalSearch?.query === trimmed ? this.externalSearch.sessions : null;
+        const source = external ?? this.allSessions;
+        const nameFiltered = this.nameFilter === "all" ? source : source.filter((session) => hasSessionName(session));
+        if (this.sortMode === "threaded" && !trimmed) {
+            // Threaded mode without search: show tree structure
+            const roots = buildSessionTree(nameFiltered);
+            this.filteredSessions = flattenSessionTree(roots, this.expandedChains);
+        }
+        else {
+            // Catalog search results are already ranked; fallback sessions retain the built-in matcher.
+            const filtered = external ? nameFiltered : filterAndSortSessions(nameFiltered, query, this.sortMode, "all");
+            this.filteredSessions = filtered.map((session) => ({
+                session,
+                displayModified: getOwnModified(session),
+                depth: 0,
+                isLast: true,
+                ancestorContinues: [],
+                collapsedAncestors: 0,
+            }));
+        }
+        this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
+    }
+''',
+    '''setSearchResults(query, sessions) {''',
+)
+
+replace_once(
+    SELECTOR,
+    "render catalog excerpts",
+    '''            const displayText = session.name ?? session.firstMessage;''',
+    '''            const displayText = this.getSearchQuery() && session.searchExcerpt ? session.searchExcerpt : session.name ?? session.firstMessage;''',
+    '''session.searchExcerpt ? session.searchExcerpt''',
+)
+
+replace_once(
+    SELECTOR,
+    "schedule search on input",
+    '''        else {
+            this.searchInput.handleInput(keyData);
+            this.filterSessions(this.searchInput.getValue());
+        }
+''',
+    '''        else {
+            this.searchInput.handleInput(keyData);
+            this.externalSearch = null;
+            const query = this.searchInput.getValue();
+            this.filterSessions(query);
+            this.onSearchQuery?.(query);
+        }
+''',
+    '''this.onSearchQuery?.(query);''',
+)
+
+replace_once(
+    SELECTOR,
+    "search after noninvasive query deletion",
+    '''            if (this.searchInput.getValue().length > 0) {
+                this.searchInput.handleInput(keyData);
+                this.filterSessions(this.searchInput.getValue());
+                return;
+            }
+''',
+    '''            if (this.searchInput.getValue().length > 0) {
+                this.searchInput.handleInput(keyData);
+                this.externalSearch = null;
+                const query = this.searchInput.getValue();
+                this.filterSessions(query);
+                this.onSearchQuery?.(query);
+                return;
+            }
+''',
+    '''this.onSearchQuery?.(query);
+                return;
+            }
+            this.startDeleteConfirmationForSelectedSession();''',
+)
+
+replace_once(
+    SELECTOR,
+    "selector async search fields",
+    '''    progressRenderedCounts = { current: 0, subtree: 0, all: 0 };
+    progressSessionCaches = { current: null, subtree: null, all: null };
+    mode = "list";
+''',
+    '''    progressRenderedCounts = { current: 0, subtree: 0, all: 0 };
+    progressSessionCaches = { current: null, subtree: null, all: null };
+    searchSessions;
+    searchTimer = null;
+    searchAbort = null;
+    searchSeq = 0;
+    mode = "list";
+''',
+    '''searchAbort = null;''',
+)
+
+replace_once(
+    SELECTOR,
+    "selector catalog search setup",
+    '''        this.allSessionsLoader = allSessionsLoader;
+        this.requestRender = requestRender;
+        this.header = new SessionSelectorHeader(this.scope, this.sortMode, this.nameFilter, this.requestRender);
+        const renameSession = options?.renameSession;
+''',
+    '''        this.allSessionsLoader = allSessionsLoader;
+        this.requestRender = requestRender;
+        this.searchSessions = options?.searchSessions;
+        this.header = new SessionSelectorHeader(this.scope, this.sortMode, this.nameFilter, this.requestRender, !!this.searchSessions);
+        const renameSession = options?.renameSession;
+''',
+    '''this.searchSessions = options?.searchSessions;''',
+)
+
+replace_once(
+    SELECTOR,
+    "bind catalog search input",
+    '''        this.sessionList.onToggleScope = () => this.toggleScope();
+        this.sessionList.onToggleSort = () => this.toggleSortMode();
+''',
+    '''        this.sessionList.onSearchQuery = (query) => this.scheduleCatalogSearch(query);
+        this.sessionList.onToggleScope = () => this.toggleScope();
+        this.sessionList.onToggleSort = () => this.toggleSortMode();
+''',
+    '''this.sessionList.onSearchQuery =''',
+)
+
+replace_once(
+    SELECTOR,
+    "cancel search on selector exit",
+    '''        this.sessionList.onSelect = (sessionPath) => {
+            clearStatusMessage();
+            onSelect(sessionPath);
+        };
+        this.sessionList.onCancel = () => {
+            clearStatusMessage();
+            onCancel();
+        };
+        this.sessionList.onExit = () => {
+            clearStatusMessage();
+            onExit();
+        };
+''',
+    '''        this.sessionList.onSelect = (sessionPath) => {
+            clearStatusMessage();
+            this.cancelCatalogSearch();
+            onSelect(sessionPath);
+        };
+        this.sessionList.onCancel = () => {
+            clearStatusMessage();
+            this.cancelCatalogSearch();
+            onCancel();
+        };
+        this.sessionList.onExit = () => {
+            clearStatusMessage();
+            this.cancelCatalogSearch();
+            onExit();
+        };
+''',
+    '''this.cancelCatalogSearch();
+            onSelect(sessionPath);''',
+)
+
+replace_once(
+    SELECTOR,
+    "debounced cancellable catalog search",
+    '''    mergeProgressSessions(scope, available) {
+        const existing = this.progressSessionCaches[scope] ?? [];
+        const byPath = new Map(existing.map((session) => [session.path, session]));
+        for (const session of available)
+            byPath.set(session.path, session);
+        const sessions = [...byPath.values()].sort((a, b) => b.modified.getTime() - a.modified.getTime());
+        this.progressSessionCaches[scope] = sessions;
+        if (scope === "current")
+            this.currentSessions = sessions;
+        else if (scope === "subtree")
+            this.subtreeSessions = sessions;
+        else
+            this.allSessions = sessions;
+        return sessions;
+    }
+    enterRenameMode(sessionPath, currentName) {
+''',
+    '''    mergeProgressSessions(scope, available) {
+        const existing = this.progressSessionCaches[scope] ?? [];
+        const byPath = new Map(existing.map((session) => [session.path, session]));
+        for (const session of available)
+            byPath.set(session.path, session);
+        const sessions = [...byPath.values()].sort((a, b) => b.modified.getTime() - a.modified.getTime());
+        this.progressSessionCaches[scope] = sessions;
+        if (scope === "current")
+            this.currentSessions = sessions;
+        else if (scope === "subtree")
+            this.subtreeSessions = sessions;
+        else
+            this.allSessions = sessions;
+        return sessions;
+    }
+    cancelCatalogSearch() {
+        if (this.searchTimer !== null) {
+            clearTimeout(this.searchTimer);
+            this.searchTimer = null;
+        }
+        this.searchAbort?.abort();
+        this.searchAbort = null;
+        this.searchSeq++;
+    }
+    scheduleCatalogSearch(query, immediate = false) {
+        this.cancelCatalogSearch();
+        const trimmed = query.trim();
+        if (!this.searchSessions || !trimmed) {
+            this.sessionList.clearSearchResults();
+            this.requestRender();
+            return;
+        }
+        const seq = this.searchSeq;
+        const scope = this.scope;
+        const sortMode = this.sortMode;
+        const nameFilter = this.nameFilter;
+        const run = async () => {
+            this.searchTimer = null;
+            const controller = new AbortController();
+            this.searchAbort = controller;
+            try {
+                const sessions = await this.searchSessions(trimmed, { scope, sortMode, nameFilter, signal: controller.signal });
+                if (controller.signal.aborted || seq !== this.searchSeq || scope !== this.scope || trimmed !== this.sessionList.getSearchQuery())
+                    return;
+                this.sessionList.setSearchResults(trimmed, sessions);
+                this.requestRender();
+            }
+            catch (error) {
+                if (controller.signal.aborted || error?.name === "AbortError")
+                    return;
+                this.sessionList.onError?.(`Catalog search failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            finally {
+                if (this.searchAbort === controller)
+                    this.searchAbort = null;
+            }
+        };
+        this.searchTimer = setTimeout(() => void run(), immediate ? 0 : 120);
+    }
+    enterRenameMode(sessionPath, currentName) {
+''',
+    '''scheduleCatalogSearch(query, immediate = false) {''',
+)
+
+replace_once(
+    SELECTOR,
+    "clear stale search on scope load",
+    '''        this.progressRenderedCounts[scope] = 0;
+        this.progressSessionCaches[scope] = [];
+        // Mark loading
+''',
+    '''        this.progressRenderedCounts[scope] = 0;
+        this.progressSessionCaches[scope] = [];
+        this.sessionList.clearSearchResults();
+        // Mark loading
+''',
+    '''this.sessionList.clearSearchResults();
+        // Mark loading''',
+)
+
+replace_once(
+    SELECTOR,
+    "cancel search on scope load",
+    '''        this.progressSessionCaches[scope] = [];
+        this.sessionList.clearSearchResults();
+        // Mark loading
+''',
+    '''        this.progressSessionCaches[scope] = [];
+        this.cancelCatalogSearch();
+        this.sessionList.clearSearchResults();
+        // Mark loading
+''',
+    '''this.cancelCatalogSearch();
+        this.sessionList.clearSearchResults();
+        // Mark loading''',
+)
+
+replace_once(
+    SELECTOR,
+    "search after scope load",
+    '''            this.header.setLoading(false);
+            this.sessionList.setSessions(sessions, showCwd);
+            this.requestRender();
+''',
+    '''            this.header.setLoading(false);
+            this.sessionList.setSessions(sessions, showCwd);
+            this.scheduleCatalogSearch(this.sessionList.getSearchQuery(), true);
+            this.requestRender();
+''',
+    '''this.scheduleCatalogSearch(this.sessionList.getSearchQuery(), true);''',
+)
+
+replace_once(
+    SELECTOR,
+    "refresh search after sort",
+    '''        this.header.setSortMode(this.sortMode);
+        this.sessionList.setSortMode(this.sortMode);
+        this.requestRender();
+''',
+    '''        this.header.setSortMode(this.sortMode);
+        this.sessionList.setSortMode(this.sortMode);
+        this.scheduleCatalogSearch(this.sessionList.getSearchQuery(), true);
+        this.requestRender();
+''',
+    '''this.sessionList.setSortMode(this.sortMode);
+        this.scheduleCatalogSearch''',
+)
+
+replace_once(
+    SELECTOR,
+    "refresh search after name filter",
+    '''        this.header.setNameFilter(this.nameFilter);
+        this.sessionList.setNameFilter(this.nameFilter);
+        this.requestRender();
+''',
+    '''        this.header.setNameFilter(this.nameFilter);
+        this.sessionList.setNameFilter(this.nameFilter);
+        this.scheduleCatalogSearch(this.sessionList.getSearchQuery(), true);
+        this.requestRender();
+''',
+    '''this.sessionList.setNameFilter(this.nameFilter);
+        this.scheduleCatalogSearch''',
+)
+
+replace_once(
+    SELECTOR,
+    "refresh cached-scope catalog search",
+    '''                this.header.setLoading(false);
+                this.sessionList.setSessions(this.subtreeSessions, true);
+                this.requestRender();
+                return;
+''',
+    '''                this.header.setLoading(false);
+                this.sessionList.setSessions(this.subtreeSessions, true);
+                this.scheduleCatalogSearch(this.sessionList.getSearchQuery(), true);
+                this.requestRender();
+                return;
+''',
+    '''this.sessionList.setSessions(this.subtreeSessions, true);
+                this.scheduleCatalogSearch''',
+)
+
+replace_once(
+    SELECTOR,
+    "refresh cached all-scope catalog search",
+    '''                this.header.setLoading(false);
+                this.sessionList.setSessions(this.allSessions, true);
+                this.requestRender();
+                return;
+''',
+    '''                this.header.setLoading(false);
+                this.sessionList.setSessions(this.allSessions, true);
+                this.scheduleCatalogSearch(this.sessionList.getSearchQuery(), true);
+                this.requestRender();
+                return;
+''',
+    '''this.sessionList.setSessions(this.allSessions, true);
+                this.scheduleCatalogSearch''',
+)
+
+replace_once(
+    SELECTOR,
+    "refresh current-scope catalog search",
+    '''        this.header.setLoading(this.currentLoading);
+        this.sessionList.setSessions(this.currentSessions ?? [], false);
+        this.requestRender();
+''',
+    '''        this.header.setLoading(this.currentLoading);
+        this.sessionList.setSessions(this.currentSessions ?? [], false);
+        this.scheduleCatalogSearch(this.sessionList.getSearchQuery(), true);
+        this.requestRender();
+''',
+    '''this.sessionList.setSessions(this.currentSessions ?? [], false);
+        this.scheduleCatalogSearch''',
+)
+
+replace_once(
+    PICKER,
+    "startup catalog search option",
+    '''export async function selectSession(currentSessionsLoader, allSessionsLoader, settingsManager, cwd) {''',
+    '''export async function selectSession(currentSessionsLoader, allSessionsLoader, settingsManager, cwd, searchSessions) {''',
+    '''cwd, searchSessions)''',
+)
+
+replace_once(
+    PICKER,
+    "pass startup catalog search",
+    '''        }, () => ui.requestRender(), { showRenameHint: false, keybindings });''',
+    '''        }, () => ui.requestRender(), { showRenameHint: false, keybindings, searchSessions });''',
+    '''keybindings, searchSessions''',
+)
+
+replace_once(
+    MAIN,
+    "catalog boundary import",
+    '''import { assertValidSessionId, SessionManager } from "./core/session-manager.js";''',
+    '''import { createSessionCatalogBoundary } from "./core/session-catalog-client.js";
+import { assertValidSessionId, SessionManager } from "./core/session-manager.js";''',
+    '''from "./core/session-catalog-client.js"''',
+)
+
+replace_once(
+    MAIN,
+    "startup resume catalog boundary",
+    '''    if (parsed.resume) {
+        try {
+            const selectedPath = await selectSession((onProgress) => SessionManager.list(cwd, sessionDir, onProgress), (onProgress) => SessionManager.listAll(sessionDir, onProgress), settingsManager, cwd);
+            if (!selectedPath) {
+''',
+    '''    if (parsed.resume) {
+        try {
+            const fallbackCurrent = (onProgress) => SessionManager.list(cwd, sessionDir, onProgress);
+            const fallbackAll = (onProgress) => SessionManager.listAll(sessionDir, onProgress);
+            const catalog = createSessionCatalogBoundary({ cwd, useCatalog: sessionDir === undefined, fallbackCurrent, fallbackAll });
+            const selectedPath = await selectSession(catalog.loadCurrent, catalog.loadAll, settingsManager, cwd, catalog.search);
+            if (!selectedPath) {
+''',
+    '''createSessionCatalogBoundary({ cwd, useCatalog: sessionDir === undefined''',
+)
+
+replace_once(
+    INTERACTIVE,
+    "catalog boundary import",
+    '''import { SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.js";''',
+    '''import { createSessionCatalogBoundary } from "../../core/session-catalog-client.js";
+import { SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.js";''',
+    '''from "../../core/session-catalog-client.js"''',
+)
+
+replace_once(
+    INTERACTIVE,
+    "interactive resume catalog boundary",
+    '''            const currentCwd = path.resolve(this.sessionManager.getCwd());
+            const currentTreePrefix = currentCwd.endsWith(path.sep) ? currentCwd : `${currentCwd}${path.sep}`;
+            const inCurrentTree = (session) => {
+                if (!session.cwd)
+                    return false;
+                const cwd = path.resolve(session.cwd);
+                return cwd === currentCwd || cwd.startsWith(currentTreePrefix);
+            };
+            const loadAllSessions = (onProgress) => this.sessionManager.usesDefaultSessionDir()
+                ? SessionManager.listAll(onProgress)
+                : SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress);
+            const loadTreeSessions = async (onProgress) => (await loadAllSessions((loaded, total, available) => onProgress?.(loaded, total, available?.filter(inCurrentTree)))).filter(inCurrentTree);
+            const selector = new SessionSelectorComponent((onProgress) => SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress), loadTreeSessions, loadAllSessions, async (sessionPath) => {
+''',
+    '''            const currentCwd = path.resolve(this.sessionManager.getCwd());
+            const fallbackCurrent = (onProgress) => SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress);
+            const fallbackAll = (onProgress) => this.sessionManager.usesDefaultSessionDir()
+                ? SessionManager.listAll(onProgress)
+                : SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress);
+            const catalog = createSessionCatalogBoundary({
+                cwd: currentCwd,
+                useCatalog: this.sessionManager.usesDefaultSessionDir(),
+                fallbackCurrent,
+                fallbackAll,
+            });
+            const selector = new SessionSelectorComponent(catalog.loadCurrent, catalog.loadSubtree, catalog.loadAll, async (sessionPath) => {
+''',
+    '''const selector = new SessionSelectorComponent(catalog.loadCurrent, catalog.loadSubtree, catalog.loadAll''',
+)
+
+replace_once(
+    INTERACTIVE,
+    "interactive selector catalog search option",
+    '''                showRenameHint: true,
+                keybindings: this.keybindings,
+            }, this.sessionManager.getSessionFile());''',
+    '''                showRenameHint: true,
+                keybindings: this.keybindings,
+                searchSessions: catalog.search,
+            }, this.sessionManager.getSessionFile());''',
+    '''searchSessions: catalog.search''',
+)
+
+replace_once(
+    SELECTOR_TYPES,
+    "catalog search types",
+    '''type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
+''',
+    '''type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
+type SessionSearchScope = "current" | "subtree" | "all";
+type CatalogSessionSearch = (query: string, options: {
+    scope: SessionSearchScope;
+    sortMode: SortMode;
+    nameFilter: NameFilter;
+    signal: AbortSignal;
+}) => Promise<SessionInfo[]>;
+''',
+    '''type CatalogSessionSearch =''',
+)
+
+replace_once(
+    SELECTOR_TYPES,
+    "catalog selector signature",
+    '''    constructor(currentSessionsLoader: SessionsLoader, allSessionsLoader: SessionsLoader, onSelect: (sessionPath: string) => void, onCancel: () => void, onExit: () => void, requestRender: () => void, options?: {
+        renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+        showRenameHint?: boolean;
+        keybindings?: KeybindingsManager;
+    }, currentSessionFilePath?: string);
+''',
+    '''    constructor(currentSessionsLoader: SessionsLoader, subtreeSessionsLoader: SessionsLoader, allSessionsLoader: SessionsLoader, onSelect: (sessionPath: string) => void, onCancel: () => void, onExit: () => void, requestRender: () => void, options?: {
+        renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+        showRenameHint?: boolean;
+        keybindings?: KeybindingsManager;
+        searchSessions?: CatalogSessionSearch;
+    }, currentSessionFilePath?: string);
+''',
+    '''searchSessions?: CatalogSessionSearch''',
+)
+
+replace_once(
+    PICKER_TYPES,
+    "startup picker catalog types",
+    '''export declare function selectSession(currentSessionsLoader: SessionsLoader, allSessionsLoader: SessionsLoader, settingsManager: SettingsManager): Promise<string | null>;''',
+    '''export declare function selectSession(currentSessionsLoader: SessionsLoader, allSessionsLoader: SessionsLoader, settingsManager: SettingsManager, cwd?: string, searchSessions?: (query: string, options: {
+    scope: "current" | "subtree" | "all";
+    sortMode: "threaded" | "recent" | "relevance";
+    nameFilter: "all" | "named";
+    signal: AbortSignal;
+}) => Promise<SessionInfo[]>): Promise<string | null>;''',
+    '''searchSessions?: (query: string''',
+)
+
+# Validate every replacement before writing. Runtime client and patched targets use atomic same-directory replacement.
+for path in changed_paths:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf8") as handle:
+            handle.write(texts[path])
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, path.stat().st_mode)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+if not RUNTIME_CLIENT.exists() or RUNTIME_CLIENT.read_text("utf8") != runtime_text:
+    RUNTIME_CLIENT.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{RUNTIME_CLIENT.name}.", suffix=".tmp", dir=RUNTIME_CLIENT.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf8") as handle:
+            handle.write(runtime_text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, RUNTIME_CLIENT)
+        print(f"installed {RUNTIME_CLIENT.name}")
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+else:
+    print(f"skip {RUNTIME_CLIENT.name}: already current")
+
+if changed_paths:
+    print("session catalog resume patch applied")
+else:
+    print("session catalog resume patch already present")

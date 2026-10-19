@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+import tempfile
+from typing import Optional
+
+ROOT = Path(os.environ.get(
+    "PI_CODING_AGENT_ROOT",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent",
+))
+SESSION_MANAGER = Path(os.environ.get(
+    "PI_SESSION_MANAGER_PATH",
+    ROOT / "dist/core/session-manager.js",
+))
+SESSION_MANAGER_TYPES = Path(os.environ.get(
+    "PI_SESSION_MANAGER_TYPES_PATH",
+    ROOT / "dist/core/session-manager.d.ts",
+))
+SESSION_SELECTOR = Path(os.environ.get(
+    "PI_SESSION_SELECTOR_PATH",
+    ROOT / "dist/modes/interactive/components/session-selector.js",
+))
+SESSION_PICKER = Path(os.environ.get(
+    "PI_SESSION_PICKER_PATH",
+    ROOT / "dist/cli/session-picker.js",
+))
+INTERACTIVE_MODE = Path(os.environ.get(
+    "PI_INTERACTIVE_MODE_PATH",
+    ROOT / "dist/modes/interactive/interactive-mode.js",
+))
+
+texts = {
+    path: path.read_text("utf8")
+    for path in (SESSION_MANAGER, SESSION_MANAGER_TYPES, SESSION_SELECTOR, SESSION_PICKER, INTERACTIVE_MODE)
+}
+changed_paths = set()
+
+
+def replace_once(path: Path, label: str, old: str, new: str, marker: Optional[str] = None):
+    text = texts[path]
+    if marker and marker in text:
+        print(f"skip {path.name} {label}: already patched")
+        return
+    count = text.count(old)
+    if count == 0 and new in text:
+        print(f"skip {path.name} {label}: already patched")
+        return
+    if count != 1:
+        raise RuntimeError(f"{path} {label}: expected one match, found {count}")
+    texts[path] = text.replace(old, new)
+    changed_paths.add(path)
+    print(f"patched {path.name} {label}")
+
+
+replace_once(
+    SESSION_MANAGER,
+    "newest-first file ordering",
+    '''const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
+async function buildSessionInfosWithConcurrency(files, onLoaded) {
+    const results = new Array(files.length).fill(null);
+    const inFlight = new Set();
+    let nextIndex = 0;
+    const startNext = () => {
+        const index = nextIndex++;
+        const file = files[index];
+        if (!file)
+            return;
+        let task;
+        task = buildSessionInfo(file)
+            .then((info) => {
+            results[index] = info;
+        })
+            .catch(() => {
+            results[index] = null;
+        })
+            .finally(() => {
+            inFlight.delete(task);
+            onLoaded();
+        });
+        inFlight.add(task);
+    };
+    while (nextIndex < files.length || inFlight.size > 0) {
+        while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
+            startNext();
+        }
+        if (inFlight.size > 0) {
+            await Promise.race(inFlight);
+        }
+    }
+    return results;
+}
+''',
+    '''const MAX_CONCURRENT_SESSION_METADATA_LOADS = 32;
+async function sortSessionFilesNewestFirst(files) {
+    const dated = new Array(files.length);
+    let nextIndex = 0;
+    const workers = Array.from({ length: Math.min(files.length, MAX_CONCURRENT_SESSION_METADATA_LOADS) }, async () => {
+        while (nextIndex < files.length) {
+            const index = nextIndex++;
+            const path = files[index];
+            try {
+                dated[index] = { path, mtimeMs: (await stat(path)).mtimeMs };
+            }
+            catch {
+                dated[index] = { path, mtimeMs: Number.NEGATIVE_INFINITY };
+            }
+        }
+    });
+    await Promise.all(workers);
+    return dated
+        .sort((a, b) => b.mtimeMs - a.mtimeMs || a.path.localeCompare(b.path))
+        .map(({ path }) => path);
+}
+const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
+async function buildSessionInfosWithConcurrency(files, onLoaded) {
+    const results = new Array(files.length);
+    const inFlight = new Set();
+    const initialLoadLimit = Math.min(files.length, MAX_CONCURRENT_SESSION_INFO_LOADS);
+    let nextIndex = 0;
+    let nextPublishedIndex = 0;
+    let hasPublished = false;
+    const startNext = () => {
+        const index = nextIndex++;
+        const file = files[index];
+        if (!file)
+            return;
+        let task;
+        task = buildSessionInfo(file)
+            .then((info) => {
+            results[index] = info;
+        })
+            .catch(() => {
+            results[index] = null;
+        })
+            .finally(() => {
+            inFlight.delete(task);
+            const available = [];
+            while (nextPublishedIndex < results.length && results[nextPublishedIndex] !== undefined) {
+                const info = results[nextPublishedIndex++];
+                if (info)
+                    available.push(info);
+            }
+            if (available.length > 0)
+                hasPublished = true;
+            onLoaded(available);
+        });
+        inFlight.add(task);
+    };
+    while (nextIndex < files.length || inFlight.size > 0) {
+        const loadLimit = hasPublished || nextPublishedIndex >= initialLoadLimit ? files.length : initialLoadLimit;
+        while (nextIndex < loadLimit && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
+            startNext();
+        }
+        if (inFlight.size > 0) {
+            await Promise.race(inFlight);
+        }
+    }
+    return results;
+}
+''',
+    '''function sortSessionFilesNewestFirst(files)''',
+)
+
+replace_once(
+    SESSION_MANAGER,
+    "lightweight newest-session previews",
+    '''const MAX_CONCURRENT_SESSION_METADATA_LOADS = 32;
+''',
+    '''const SESSION_PREVIEW_BYTES = 256 * 1024;
+const SESSION_PREVIEW_COUNT = 10;
+async function buildSessionPreview(filePath) {
+    try {
+        const stats = await stat(filePath);
+        let header = null;
+        let name;
+        let firstMessage = "";
+        const rl = createInterface({
+            input: createReadStream(filePath, { encoding: "utf8", start: 0, end: SESSION_PREVIEW_BYTES - 1 }),
+            crlfDelay: Infinity,
+        });
+        for await (const line of rl) {
+            const entry = parseSessionEntryLine(line);
+            if (!entry)
+                continue;
+            if (!header) {
+                if (entry.type !== "session")
+                    return null;
+                header = entry;
+                continue;
+            }
+            if (entry.type === "session_info") {
+                name = entry.name?.trim() || undefined;
+                continue;
+            }
+            if (entry.type !== "message" || entry.message?.role !== "user" || !isMessageWithContent(entry.message))
+                continue;
+            firstMessage = extractTextContent(entry.message);
+            if (firstMessage)
+                break;
+        }
+        if (!header)
+            return null;
+        return {
+            path: filePath,
+            id: header.id,
+            cwd: typeof header.cwd === "string" ? header.cwd : "",
+            name,
+            parentSessionPath: header.parentSession,
+            created: new Date(header.timestamp),
+            modified: stats.mtime,
+            messageCount: 0,
+            firstMessage: firstMessage || "(loading session…)",
+            allMessagesText: firstMessage,
+            partial: true,
+        };
+    }
+    catch {
+        return null;
+    }
+}
+const MAX_CONCURRENT_SESSION_PREVIEW_LOADS = 16;
+async function buildSessionPreviews(files, limit = SESSION_PREVIEW_COUNT) {
+    const selected = files.slice(0, limit);
+    const previews = new Array(selected.length);
+    let nextIndex = 0;
+    const workers = Array.from({ length: Math.min(selected.length, MAX_CONCURRENT_SESSION_PREVIEW_LOADS) }, async () => {
+        while (nextIndex < selected.length) {
+            const index = nextIndex++;
+            previews[index] = await buildSessionPreview(selected[index]);
+        }
+    });
+    await Promise.all(workers);
+    return previews.filter((preview) => preview !== null);
+}
+const MAX_CONCURRENT_SESSION_METADATA_LOADS = 32;
+''',
+    '''async function buildSessionPreview(filePath)''',
+)
+
+
+
+
+
+
+replace_once(
+    SESSION_MANAGER,
+    "directory progress batches",
+    '''        const dirEntries = await readdir(dir);
+        const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+        const total = progressTotal ?? files.length;
+        let loaded = 0;
+        const results = await buildSessionInfosWithConcurrency(files, () => {
+            loaded++;
+            onProgress?.(progressOffset + loaded, total);
+        });
+''',
+    '''        const dirEntries = await readdir(dir);
+        const files = await sortSessionFilesNewestFirst(dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f)));
+        const total = progressTotal ?? files.length;
+        let loaded = 0;
+        const results = await buildSessionInfosWithConcurrency(files, (available) => {
+            loaded++;
+            onProgress?.(progressOffset + loaded, total, available);
+        });
+''',
+    '''onProgress?.(progressOffset + loaded, total, available);''',
+)
+
+
+replace_once(
+    SESSION_MANAGER,
+    "configurable directory preview scope",
+    '''async function listSessionsFromDir(dir, onProgress, progressOffset = 0, progressTotal) {''',
+    '''async function listSessionsFromDir(dir, onProgress, progressOffset = 0, progressTotal, previewAll = false) {''',
+    '''progressTotal, previewAll = false''',
+)
+
+replace_once(
+    SESSION_MANAGER,
+    "publish directory previews",
+    '''        const total = progressTotal ?? files.length;
+        let loaded = 0;
+''',
+    '''        const total = progressTotal ?? files.length;
+        if (onProgress) {
+            const previews = await buildSessionPreviews(files, previewAll ? files.length : SESSION_PREVIEW_COUNT);
+            onProgress(progressOffset, total, previews);
+        }
+        let loaded = 0;
+''',
+    '''const previews = await buildSessionPreviews(files);''',
+)
+
+
+replace_once(
+    SESSION_MANAGER,
+    "custom cwd progress filtering",
+    '''        const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+        const resolvedCwd = resolvePath(cwd);
+        const sessions = (await listSessionsFromDir(dir, onProgress)).filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd));
+''',
+    '''        const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+        const resolvedCwd = resolvePath(cwd);
+        const reportProgress = filterCwd && onProgress
+            ? (loaded, total, available) => onProgress(loaded, total, available?.filter((session) => sessionCwdMatches(session.cwd, resolvedCwd)))
+            : onProgress;
+        const sessions = (await listSessionsFromDir(dir, reportProgress)).filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd));
+''',
+    '''const reportProgress = filterCwd && onProgress''',
+)
+
+replace_once(
+    SESSION_MANAGER,
+    "preview every custom-dir session for all scope",
+    '''            const sessions = await listSessionsFromDir(customSessionDir, progress);''',
+    '''            const sessions = await listSessionsFromDir(customSessionDir, progress, 0, undefined, true);''',
+    '''listSessionsFromDir(customSessionDir, progress, 0, undefined, true)''',
+)
+
+replace_once(
+    SESSION_MANAGER,
+    "preview every custom-cwd session",
+    '''        const sessions = (await listSessionsFromDir(dir, reportProgress)).filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd));''',
+    '''        const sessions = (await listSessionsFromDir(dir, reportProgress, 0, undefined, filterCwd)).filter((session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd));''',
+    '''listSessionsFromDir(dir, reportProgress, 0, undefined, filterCwd)''',
+)
+
+replace_once(
+    SESSION_MANAGER,
+    "all-session progress batches",
+    '''            const sessions = [];
+            const allFiles = dirFiles.flat();
+            const results = await buildSessionInfosWithConcurrency(allFiles, () => {
+                loaded++;
+                progress?.(loaded, totalFiles);
+            });
+''',
+    '''            const sessions = [];
+            const allFiles = await sortSessionFilesNewestFirst(dirFiles.flat());
+            const results = await buildSessionInfosWithConcurrency(allFiles, (available) => {
+                loaded++;
+                progress?.(loaded, totalFiles, available);
+            });
+''',
+    '''progress?.(loaded, totalFiles, available);''',
+)
+
+replace_once(
+    SESSION_MANAGER,
+    "publish all-session previews",
+    '''            const allFiles = await sortSessionFilesNewestFirst(dirFiles.flat());
+            const results = await buildSessionInfosWithConcurrency(allFiles, (available) => {
+''',
+    '''            const allFiles = await sortSessionFilesNewestFirst(dirFiles.flat());
+            if (progress) {
+                const previews = await buildSessionPreviews(allFiles, allFiles.length);
+                progress(0, totalFiles, previews);
+            }
+            const results = await buildSessionInfosWithConcurrency(allFiles, (available) => {
+''',
+    '''progress(0, totalFiles, previews);''',
+)
+
+
+
+replace_once(
+    SESSION_MANAGER_TYPES,
+    "partial session info type",
+    '''    allMessagesText: string;
+}''',
+    '''    allMessagesText: string;
+    /** True only for a lightweight progressive picker preview. */
+    partial?: boolean;
+}''',
+    '''partial?: boolean;''',
+)
+
+replace_once(
+    SESSION_MANAGER_TYPES,
+    "progress callback type",
+    '''export type SessionListProgress = (loaded: number, total: number) => void;''',
+    '''export type SessionListProgress = (loaded: number, total: number, available?: SessionInfo[]) => void;''',
+    '''available?: SessionInfo[]''',
+)
+
+selector_text = texts[SESSION_SELECTOR]
+if "session.__piOwnModified instanceof Date" not in selector_text:
+    raise RuntimeError(f"{SESSION_SELECTOR} is missing the session-chain recency patch")
+
+replace_once(
+    SESSION_SELECTOR,
+    "cache canonical session paths",
+    '''function canonicalizePath(path) {
+    if (!path)
+        return path;
+    return _canonicalizePath(path);
+}
+function getOwnModified(session) {
+''',
+    '''const canonicalPathCache = new Map();
+function canonicalizePath(path) {
+    if (!path)
+        return path;
+    const cached = canonicalPathCache.get(path);
+    if (cached)
+        return cached;
+    const canonical = _canonicalizePath(path);
+    canonicalPathCache.set(path, canonical);
+    return canonical;
+}
+function getOwnModified(session) {
+''',
+    '''const canonicalPathCache = new Map();''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "track collapsed chain paths",
+    '''        while (displayNode.children.length === 1) {
+            displayNode = displayNode.children[0];
+            chain.push(displayNode);
+        }
+        const collapsedAncestors = chain.length - 1;
+''',
+    '''        while (displayNode.children.length === 1) {
+            displayNode = displayNode.children[0];
+            chain.push(displayNode);
+        }
+        const chainPaths = chain.map((item) => sessionKey(item.session));
+        const collapsedAncestors = chain.length - 1;
+''',
+    '''const chainPaths = chain.map((item) => sessionKey(item.session));''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "attach collapsed chain paths",
+    '''            result.push({ session: displayNode.session, displayModified: displayNode.ownModified, depth, isLast, ancestorContinues, collapsedAncestors, chainKey, chainExpanded });''',
+    '''            result.push({ session: displayNode.session, displayModified: displayNode.ownModified, depth, isLast, ancestorContinues, collapsedAncestors, chainKey, chainExpanded, chainPaths });''',
+    '''chainExpanded, chainPaths''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "expand a chain to preserve hidden selection",
+    '''    selectSessionPath(path) {
+        const target = canonicalizePath(path) ?? path;
+        const idx = this.filteredSessions.findIndex((node) => (canonicalizePath(node.session.path) ?? node.session.path) === target);
+        if (idx !== -1) this.selectedIndex = idx;
+    }
+''',
+    '''    selectSessionPath(path) {
+        const target = canonicalizePath(path) ?? path;
+        let idx = this.filteredSessions.findIndex((node) => (canonicalizePath(node.session.path) ?? node.session.path) === target);
+        if (idx === -1 && this.sortMode === "threaded" && !this.searchInput.getValue().trim()) {
+            const collapsed = this.filteredSessions.find((node) => node.chainKey && node.chainPaths?.includes(target));
+            if (collapsed) {
+                this.expandedChains.add(collapsed.chainKey);
+                this.filterSessions(this.searchInput.getValue());
+                idx = this.filteredSessions.findIndex((node) => (canonicalizePath(node.session.path) ?? node.session.path) === target);
+            }
+        }
+        if (idx !== -1)
+            this.selectedIndex = idx;
+    }
+''',
+    '''node.chainPaths?.includes(target)''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "stable selection during backfill",
+    '''    setSessions(sessions, showCwd) {
+        this.allSessions = sessions;
+        this.showCwd = showCwd;
+        this.filterSessions(this.searchInput.getValue());
+    }
+''',
+    '''    setSessions(sessions, showCwd) {
+        const selectedPath = this.getSelectedSessionPath();
+        this.allSessions = sessions;
+        this.showCwd = showCwd;
+        this.filterSessions(this.searchInput.getValue());
+        if (selectedPath)
+            this.selectSessionPath(selectedPath);
+    }
+''',
+    '''const selectedPath = this.getSelectedSessionPath();''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "render provisional message count",
+    '''            const msgCount = String(session.messageCount);''',
+    '''            const msgCount = session.partial ? "…" : String(session.messageCount);''',
+    '''session.partial ? "…"''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "sequence every scope load",
+    '''    currentLoading = false;
+    subtreeLoading = false;
+    allLoading = false;
+    subtreeLoadSeq = 0;
+    allLoadSeq = 0;
+''',
+    '''    currentLoading = false;
+    subtreeLoading = false;
+    allLoading = false;
+    currentLoadSeq = 0;
+    subtreeLoadSeq = 0;
+    allLoadSeq = 0;
+''',
+    '''currentLoadSeq = 0;''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "track rendered progressive counts",
+    '''    currentLoadSeq = 0;
+    subtreeLoadSeq = 0;
+    allLoadSeq = 0;
+    mode = "list";
+''',
+    '''    currentLoadSeq = 0;
+    subtreeLoadSeq = 0;
+    allLoadSeq = 0;
+    progressRenderedCounts = { current: 0, subtree: 0, all: 0 };
+    progressSessionCaches = { current: null, subtree: null, all: null };
+    mode = "list";
+''',
+    '''progressRenderedCounts = { current: 0, subtree: 0, all: 0 };''',
+)
+
+
+replace_once(
+    SESSION_SELECTOR,
+    "select current scope generation",
+    '''        const seq = scope === "all" ? ++this.allLoadSeq : scope === "subtree" ? ++this.subtreeLoadSeq : undefined;
+        const currentSeq = () => scope === "all" ? this.allLoadSeq : scope === "subtree" ? this.subtreeLoadSeq : undefined;
+''',
+    '''        const seq = scope === "all" ? ++this.allLoadSeq : scope === "subtree" ? ++this.subtreeLoadSeq : ++this.currentLoadSeq;
+        const currentSeq = () => scope === "all" ? this.allLoadSeq : scope === "subtree" ? this.subtreeLoadSeq : this.currentLoadSeq;
+''',
+    '''++this.currentLoadSeq''',
+)
+
+replace_once(
+    SESSION_SELECTOR,
+    "reset progressive render count per load",
+    '''    async loadScope(scope, reason) {
+        const showCwd = scope !== "current";
+        // Mark loading
+''',
+    '''    async loadScope(scope, reason) {
+        const showCwd = scope !== "current";
+        this.progressRenderedCounts[scope] = 0;
+        this.progressSessionCaches[scope] = [];
+        // Mark loading
+''',
+    '''this.progressRenderedCounts[scope] = 0;''',
+)
+
+
+replace_once(
+    SESSION_SELECTOR,
+    "progressive scope cache merge",
+    '''    loadCurrentSessions() {
+        void this.loadScope("current", "initial");
+    }
+    enterRenameMode(sessionPath, currentName) {
+''',
+    '''    loadCurrentSessions() {
+        void this.loadScope("current", "initial");
+    }
+    mergeProgressSessions(scope, available) {
+        const existing = this.progressSessionCaches[scope] ?? [];
+        const byPath = new Map(existing.map((session) => [session.path, session]));
+        for (const session of available)
+            byPath.set(session.path, session);
+        const sessions = [...byPath.values()].sort((a, b) => b.modified.getTime() - a.modified.getTime());
+        this.progressSessionCaches[scope] = sessions;
+        if (scope === "current")
+            this.currentSessions = sessions;
+        else if (scope === "subtree")
+            this.subtreeSessions = sessions;
+        else
+            this.allSessions = sessions;
+        return sessions;
+    }
+    enterRenameMode(sessionPath, currentName) {
+''',
+    '''mergeProgressSessions(scope, available) {''',
+)
+
+
+replace_once(
+    SESSION_SELECTOR,
+    "render progressive batches",
+    '''        const onProgress = (loaded, total) => {
+            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== currentSeq())
+                return;
+            this.header.setProgress(loaded, total);
+            this.requestRender();
+        };
+''',
+    '''        const onProgress = (loaded, total, available) => {
+            if (seq !== currentSeq())
+                return;
+            const sessions = available?.length ? this.mergeProgressSessions(scope, available) : undefined;
+            if (scope !== this.scope)
+                return;
+            this.header.setProgress(loaded, total);
+            const renderedCount = this.progressRenderedCounts[scope];
+            if (sessions && (renderedCount === 0 || sessions.length - renderedCount >= 25 || loaded === total)) {
+                this.sessionList.setSessions(sessions, showCwd);
+                this.progressRenderedCounts[scope] = sessions.length;
+            }
+            this.requestRender();
+        };
+''',
+    '''available?.length ? this.mergeProgressSessions(scope, available)''',
+)
+
+
+replace_once(
+    SESSION_SELECTOR,
+    "guard final scope state by generation",
+    '''            if (scope === "current") {
+                this.currentSessions = sessions;
+                this.currentLoading = false;
+            }
+            else if (scope === "subtree") {
+                this.subtreeSessions = sessions;
+                this.subtreeLoading = false;
+            }
+            else {
+                this.allSessions = sessions;
+                this.allLoading = false;
+            }
+            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== currentSeq())
+                return;
+            this.header.setLoading(false);
+            this.sessionList.setSessions(sessions, showCwd);
+            this.requestRender();
+        }
+        catch (err) {
+            if (scope === "current") {
+                this.currentLoading = false;
+            }
+            else if (scope === "subtree") {
+                this.subtreeLoading = false;
+            }
+            else {
+                this.allLoading = false;
+            }
+            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== currentSeq())
+                return;
+            const message = err instanceof Error ? err.message : String(err);
+''',
+    '''            if (seq !== currentSeq())
+                return;
+            if (scope === "current") {
+                this.currentSessions = sessions;
+                this.currentLoading = false;
+            }
+            else if (scope === "subtree") {
+                this.subtreeSessions = sessions;
+                this.subtreeLoading = false;
+            }
+            else {
+                this.allSessions = sessions;
+                this.allLoading = false;
+            }
+            if (scope !== this.scope)
+                return;
+            this.header.setLoading(false);
+            this.sessionList.setSessions(sessions, showCwd);
+            this.requestRender();
+        }
+        catch (err) {
+            if (seq !== currentSeq())
+                return;
+            if (scope === "current") {
+                this.currentLoading = false;
+            }
+            else if (scope === "subtree") {
+                this.subtreeLoading = false;
+            }
+            else {
+                this.allLoading = false;
+            }
+            if (scope !== this.scope)
+                return;
+            const message = err instanceof Error ? err.message : String(err);
+''',
+    '''if (seq !== currentSeq())
+                return;
+            if (scope === "current")''',
+)
+
+replace_once(
+    SESSION_PICKER,
+    "subtree progressive filtering",
+    '''        const currentCwd = cwd ? resolvePath(cwd) : undefined;
+        const subtreeSessionsLoader = async (onProgress) => {
+            const sessions = await allSessionsLoader(onProgress);
+            if (!currentCwd)
+                return sessions;
+            return sessions.filter((session) => {
+                const sessionCwd = resolvePath(session.cwd);
+                return sessionCwd === currentCwd || sessionCwd.startsWith(`${currentCwd}${sep}`);
+            });
+        };
+''',
+    '''        const currentCwd = cwd ? resolvePath(cwd) : undefined;
+        const inCurrentTree = (session) => {
+            if (!currentCwd)
+                return true;
+            if (!session.cwd)
+                return false;
+            const sessionCwd = resolvePath(session.cwd);
+            return sessionCwd === currentCwd || sessionCwd.startsWith(`${currentCwd}${sep}`);
+        };
+        const subtreeSessionsLoader = async (onProgress) => {
+            const sessions = await allSessionsLoader((loaded, total, available) => onProgress?.(loaded, total, available?.filter(inCurrentTree)));
+            return sessions.filter(inCurrentTree);
+        };
+''',
+    '''available?.filter(inCurrentTree)''',
+)
+
+replace_once(
+    SESSION_PICKER,
+    "reject missing cwd from startup subtree",
+    '''        const inCurrentTree = (session) => {
+            if (!currentCwd)
+                return true;
+            const sessionCwd = resolvePath(session.cwd);
+''',
+    '''        const inCurrentTree = (session) => {
+            if (!currentCwd)
+                return true;
+            if (!session.cwd)
+                return false;
+            const sessionCwd = resolvePath(session.cwd);
+''',
+    '''if (!session.cwd)
+                return false;''',
+)
+
+replace_once(
+    SESSION_PICKER,
+    "root-safe startup subtree prefix",
+    '''        const currentCwd = cwd ? resolvePath(cwd) : undefined;
+        const inCurrentTree = (session) => {
+''',
+    '''        const currentCwd = cwd ? resolvePath(cwd) : undefined;
+        const currentTreePrefix = currentCwd ? (currentCwd.endsWith(sep) ? currentCwd : `${currentCwd}${sep}`) : undefined;
+        const inCurrentTree = (session) => {
+''',
+    '''const currentTreePrefix = currentCwd ?''',
+)
+
+replace_once(
+    SESSION_PICKER,
+    "use startup subtree prefix",
+    '''            return sessionCwd === currentCwd || sessionCwd.startsWith(`${currentCwd}${sep}`);''',
+    '''            return sessionCwd === currentCwd || sessionCwd.startsWith(currentTreePrefix);''',
+    '''sessionCwd.startsWith(currentTreePrefix)''',
+)
+
+if "createSessionCatalogBoundary" in texts[INTERACTIVE_MODE]:
+    print(f"skip {INTERACTIVE_MODE.name} subtree patches: session catalog boundary owns these loaders")
+else:
+    replace_once(
+        INTERACTIVE_MODE,
+        "interactive subtree progressive filtering",
+        '''            const loadAllSessions = (onProgress) => this.sessionManager.usesDefaultSessionDir()
+                ? SessionManager.listAll(onProgress)
+                : SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress);
+            const selector = new SessionSelectorComponent((onProgress) => SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress), async (onProgress) => (await loadAllSessions(onProgress)).filter(inCurrentTree), loadAllSessions, async (sessionPath) => {
+''',
+        '''            const loadAllSessions = (onProgress) => this.sessionManager.usesDefaultSessionDir()
+                ? SessionManager.listAll(onProgress)
+                : SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress);
+            const loadTreeSessions = async (onProgress) => (await loadAllSessions((loaded, total, available) => onProgress?.(loaded, total, available?.filter(inCurrentTree)))).filter(inCurrentTree);
+            const selector = new SessionSelectorComponent((onProgress) => SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress), loadTreeSessions, loadAllSessions, async (sessionPath) => {
+''',
+        '''const loadTreeSessions = async (onProgress)''',
+    )
+
+    replace_once(
+        INTERACTIVE_MODE,
+        "root-safe interactive subtree prefix",
+        '''            const currentCwd = path.resolve(this.sessionManager.getCwd());
+            const inCurrentTree = (session) => {
+''',
+        '''            const currentCwd = path.resolve(this.sessionManager.getCwd());
+            const currentTreePrefix = currentCwd.endsWith(path.sep) ? currentCwd : `${currentCwd}${path.sep}`;
+            const inCurrentTree = (session) => {
+''',
+        '''const currentTreePrefix = currentCwd.endsWith(path.sep)''',
+    )
+
+    replace_once(
+        INTERACTIVE_MODE,
+        "use interactive subtree prefix",
+        '''                return cwd === currentCwd || cwd.startsWith(`${currentCwd}${path.sep}`);''',
+        '''                return cwd === currentCwd || cwd.startsWith(currentTreePrefix);''',
+        '''cwd.startsWith(currentTreePrefix)''',
+    )
+
+    replace_once(
+        INTERACTIVE_MODE,
+        "reject missing cwd from interactive subtree",
+        '''            const inCurrentTree = (session) => {
+                const cwd = path.resolve(session.cwd);
+''',
+        '''            const inCurrentTree = (session) => {
+                if (!session.cwd)
+                    return false;
+                const cwd = path.resolve(session.cwd);
+''',
+        '''const inCurrentTree = (session) => {
+                if (!session.cwd)''',
+    )
+
+# Every replacement is validated before any target is changed. Writes use same-directory atomic replacement.
+for path in changed_paths:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf8") as handle:
+            handle.write(texts[path])
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, path.stat().st_mode)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+if changed_paths:
+    print("progressive session listing patch applied")
+else:
+    print("progressive session listing patch already present")

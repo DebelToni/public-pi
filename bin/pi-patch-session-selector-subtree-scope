@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+import tempfile
+
+SESSION_SELECTOR = Path(os.environ.get(
+    "PI_SESSION_SELECTOR_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/session-selector.js",
+))
+INTERACTIVE_MODE = Path(os.environ.get(
+    "PI_INTERACTIVE_MODE_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js",
+))
+SESSION_PICKER = Path(os.environ.get(
+    "PI_SESSION_PICKER_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli/session-picker.js",
+))
+MAIN = Path(os.environ.get(
+    "PI_MAIN_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/main.js",
+))
+paths = (SESSION_SELECTOR, INTERACTIVE_MODE, SESSION_PICKER, MAIN)
+texts = {path: path.read_text("utf8") for path in paths}
+changed_paths = set()
+
+
+def patch_file(path: Path, patches):
+    text = texts[path]
+    for label, old, new, marker in patches:
+        if marker and marker in text:
+            print(f"skip {path.name} {label}: already patched")
+            continue
+        count = text.count(old)
+        if count == 0 and new in text:
+            print(f"skip {path.name} {label}: already patched")
+            continue
+        if count != 1:
+            raise RuntimeError(f"{path} {label}: expected one match, found {count}")
+        text = text.replace(old, new)
+        changed_paths.add(path)
+        print(f"patched {path.name} {label}")
+    texts[path] = text
+
+
+selector_patches = [
+    (
+        "header title",
+        '''        const title = this.scope === "current" ? "Resume Session (Current Folder)" : "Resume Session (All)";
+''',
+        '''        const title = this.scope === "current" ? "Resume Session (Current Folder)" : this.scope === "subtree" ? "Resume Session (Current Tree)" : "Resume Session (All)";
+''',
+        '''Resume Session (Current Tree)''',
+    ),
+    (
+        "header scope labels",
+        '''        if (this.loading) {
+            const progressText = this.loadProgress ? `${this.loadProgress.loaded}/${this.loadProgress.total}` : "...";
+            scopeText = `${theme.fg("muted", "○ Current Folder | ")}${theme.fg("accent", `Loading ${progressText}`)}`;
+        }
+        else if (this.scope === "current") {
+            scopeText = `${theme.fg("accent", "◉ Current Folder")}${theme.fg("muted", " | ○ All")}`;
+        }
+        else {
+            scopeText = `${theme.fg("muted", "○ Current Folder | ")}${theme.fg("accent", "◉ All")}`;
+        }
+''',
+        '''        if (this.loading) {
+            const progressText = this.loadProgress ? `${this.loadProgress.loaded}/${this.loadProgress.total}` : "...";
+            scopeText = `${theme.fg("muted", "○ Current | ○ Tree | ")}${theme.fg("accent", `Loading ${progressText}`)}`;
+        }
+        else if (this.scope === "current") {
+            scopeText = `${theme.fg("accent", "◉ Current")}${theme.fg("muted", " | ○ Tree | ○ All")}`;
+        }
+        else if (this.scope === "subtree") {
+            scopeText = `${theme.fg("muted", "○ Current | ")}${theme.fg("accent", "◉ Tree")}${theme.fg("muted", " | ○ All")}`;
+        }
+        else {
+            scopeText = `${theme.fg("muted", "○ Current | ○ Tree | ")}${theme.fg("accent", "◉ All")}`;
+        }
+''',
+        '''◉ Tree''',
+    ),
+    (
+        "session caches",
+        '''    currentSessions = null;
+    allSessions = null;
+    currentSessionsLoader;
+    allSessionsLoader;
+''',
+        '''    currentSessions = null;
+    subtreeSessions = null;
+    allSessions = null;
+    currentSessionsLoader;
+    subtreeSessionsLoader;
+    allSessionsLoader;
+''',
+        '''subtreeSessionsLoader;''',
+    ),
+    (
+        "loading state",
+        '''    currentLoading = false;
+    allLoading = false;
+    allLoadSeq = 0;
+''',
+        '''    currentLoading = false;
+    subtreeLoading = false;
+    allLoading = false;
+    subtreeLoadSeq = 0;
+    allLoadSeq = 0;
+''',
+        '''subtreeLoadSeq = 0;''',
+    ),
+    (
+        "constructor signature",
+        '''    constructor(currentSessionsLoader, allSessionsLoader, onSelect, onCancel, onExit, requestRender, options, currentSessionFilePath) {
+''',
+        '''    constructor(currentSessionsLoader, subtreeSessionsLoader, allSessionsLoader, onSelect, onCancel, onExit, requestRender, options, currentSessionFilePath) {
+''',
+        '''constructor(currentSessionsLoader, subtreeSessionsLoader, allSessionsLoader''',
+    ),
+    (
+        "constructor compatibility",
+        '''        super();
+        this.keybindings = options?.keybindings ?? KeybindingsManager.create();
+''',
+        '''        super();
+        if (typeof requestRender !== "function") {
+            currentSessionFilePath = options;
+            options = requestRender;
+            requestRender = onExit;
+            onExit = onCancel;
+            onCancel = onSelect;
+            onSelect = allSessionsLoader;
+            allSessionsLoader = subtreeSessionsLoader;
+        }
+        this.keybindings = options?.keybindings ?? KeybindingsManager.create();
+''',
+        '''if (typeof requestRender !== "function")''',
+    ),
+    (
+        "constructor loader assignment",
+        '''        this.currentSessionsLoader = currentSessionsLoader;
+        this.allSessionsLoader = allSessionsLoader;
+''',
+        '''        this.currentSessionsLoader = currentSessionsLoader;
+        this.subtreeSessionsLoader = subtreeSessionsLoader;
+        this.allSessionsLoader = allSessionsLoader;
+''',
+        '''this.subtreeSessionsLoader = subtreeSessionsLoader;''',
+    ),
+    (
+        "rename scope sessions",
+        '''            if (this.scope === "current" && this.currentLoading)
+                return;
+            if (this.scope === "all" && this.allLoading)
+                return;
+            const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
+''',
+        '''            if (this.scope === "current" && this.currentLoading)
+                return;
+            if (this.scope === "subtree" && this.subtreeLoading)
+                return;
+            if (this.scope === "all" && this.allLoading)
+                return;
+            const sessions = this.scope === "all" ? (this.allSessions ?? []) : this.scope === "subtree" ? (this.subtreeSessions ?? []) : (this.currentSessions ?? []);
+''',
+        '''this.scope === "subtree" && this.subtreeLoading''',
+    ),
+    (
+        "delete scope caches",
+        '''                if (this.allSessions) {
+                    this.allSessions = this.allSessions.filter((s) => s.path !== sessionPath);
+                }
+                const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
+                const showCwd = this.scope === "all";
+''',
+        '''                if (this.subtreeSessions) {
+                    this.subtreeSessions = this.subtreeSessions.filter((s) => s.path !== sessionPath);
+                }
+                if (this.allSessions) {
+                    this.allSessions = this.allSessions.filter((s) => s.path !== sessionPath);
+                }
+                const sessions = this.scope === "all" ? (this.allSessions ?? []) : this.scope === "subtree" ? (this.subtreeSessions ?? []) : (this.currentSessions ?? []);
+                const showCwd = this.scope !== "current";
+''',
+        '''this.subtreeSessions = this.subtreeSessions.filter''',
+    ),
+    (
+        "load state start",
+        '''    async loadScope(scope, reason) {
+        const showCwd = scope === "all";
+        // Mark loading
+        if (scope === "current") {
+            this.currentLoading = true;
+        }
+        else {
+            this.allLoading = true;
+        }
+        const seq = scope === "all" ? ++this.allLoadSeq : undefined;
+        this.header.setScope(scope);
+''',
+        '''    async loadScope(scope, reason) {
+        const showCwd = scope !== "current";
+        // Mark loading
+        if (scope === "current") {
+            this.currentLoading = true;
+        }
+        else if (scope === "subtree") {
+            this.subtreeLoading = true;
+        }
+        else {
+            this.allLoading = true;
+        }
+        const seq = scope === "all" ? ++this.allLoadSeq : scope === "subtree" ? ++this.subtreeLoadSeq : undefined;
+        const currentSeq = () => scope === "all" ? this.allLoadSeq : scope === "subtree" ? this.subtreeLoadSeq : undefined;
+        this.header.setScope(scope);
+''',
+        '''const currentSeq = () => scope === "all"''',
+    ),
+    (
+        "progress seq guard",
+        '''            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== this.allLoadSeq)
+                return;
+            this.header.setProgress(loaded, total);
+''',
+        '''            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== currentSeq())
+                return;
+            this.header.setProgress(loaded, total);
+''',
+        '''currentLoadSeq = 0;''',
+    ),
+    (
+        "scope loader",
+        '''            const sessions = await (scope === "current"
+                ? this.currentSessionsLoader(onProgress)
+                : this.allSessionsLoader(onProgress));
+            if (scope === "current") {
+                this.currentSessions = sessions;
+                this.currentLoading = false;
+            }
+            else {
+                this.allSessions = sessions;
+                this.allLoading = false;
+            }
+''',
+        '''            const sessions = await (scope === "current"
+                ? this.currentSessionsLoader(onProgress)
+                : scope === "subtree"
+                    ? this.subtreeSessionsLoader(onProgress)
+                    : this.allSessionsLoader(onProgress));
+            if (scope === "current") {
+                this.currentSessions = sessions;
+                this.currentLoading = false;
+            }
+            else if (scope === "subtree") {
+                this.subtreeSessions = sessions;
+                this.subtreeLoading = false;
+            }
+            else {
+                this.allSessions = sessions;
+                this.allLoading = false;
+            }
+''',
+        '''this.subtreeSessions = sessions;''',
+    ),
+    (
+        "result seq guard",
+        '''            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== this.allLoadSeq)
+                return;
+            this.header.setLoading(false);
+''',
+        '''            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== currentSeq())
+                return;
+            this.header.setLoading(false);
+''',
+        '''currentLoadSeq = 0;''',
+    ),
+    (
+        "catch loading state",
+        '''            if (scope === "current") {
+                this.currentLoading = false;
+            }
+            else {
+                this.allLoading = false;
+            }
+''',
+        '''            if (scope === "current") {
+                this.currentLoading = false;
+            }
+            else if (scope === "subtree") {
+                this.subtreeLoading = false;
+            }
+            else {
+                this.allLoading = false;
+            }
+''',
+        '''else if (scope === "subtree") {
+                this.subtreeLoading = false;''',
+    ),
+    (
+        "error seq guard",
+        '''            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== this.allLoadSeq)
+                return;
+            const message = err instanceof Error ? err.message : String(err);
+''',
+        '''            if (scope !== this.scope)
+                return;
+            if (seq !== undefined && seq !== currentSeq())
+                return;
+            const message = err instanceof Error ? err.message : String(err);
+''',
+        '''currentLoadSeq = 0;''',
+    ),
+    (
+        "scope cycle",
+        '''    toggleScope() {
+        if (this.scope === "current") {
+            this.scope = "all";
+            this.header.setScope(this.scope);
+            if (this.allSessions !== null) {
+                this.header.setLoading(false);
+                this.sessionList.setSessions(this.allSessions, true);
+                this.requestRender();
+                return;
+            }
+            if (!this.allLoading) {
+                void this.loadScope("all", "toggle");
+            }
+            return;
+        }
+        this.scope = "current";
+        this.header.setScope(this.scope);
+        this.header.setLoading(this.currentLoading);
+        this.sessionList.setSessions(this.currentSessions ?? [], false);
+        this.requestRender();
+    }
+''',
+        '''    toggleScope() {
+        if (this.scope === "current") {
+            this.scope = "subtree";
+            this.header.setScope(this.scope);
+            if (this.subtreeSessions !== null) {
+                this.header.setLoading(false);
+                this.sessionList.setSessions(this.subtreeSessions, true);
+                this.requestRender();
+                return;
+            }
+            if (!this.subtreeLoading) {
+                void this.loadScope("subtree", "toggle");
+            }
+            return;
+        }
+        if (this.scope === "subtree") {
+            this.scope = "all";
+            this.header.setScope(this.scope);
+            if (this.allSessions !== null) {
+                this.header.setLoading(false);
+                this.sessionList.setSessions(this.allSessions, true);
+                this.requestRender();
+                return;
+            }
+            if (!this.allLoading) {
+                void this.loadScope("all", "toggle");
+            }
+            return;
+        }
+        this.scope = "current";
+        this.header.setScope(this.scope);
+        this.header.setLoading(this.currentLoading);
+        this.sessionList.setSessions(this.currentSessions ?? [], false);
+        this.requestRender();
+    }
+''',
+        '''this.scope = "subtree";''',
+    ),
+]
+
+interactive_patches = [
+    (
+        "showSessionSelector subtree loader",
+        '''            const selector = new SessionSelectorComponent((onProgress) => SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress), (onProgress) => this.sessionManager.usesDefaultSessionDir()
+                ? SessionManager.listAll(onProgress)
+                : SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress), async (sessionPath) => {
+''',
+        '''            const currentCwd = path.resolve(this.sessionManager.getCwd());
+            const inCurrentTree = (session) => {
+                const cwd = path.resolve(session.cwd);
+                return cwd === currentCwd || cwd.startsWith(`${currentCwd}${path.sep}`);
+            };
+            const loadAllSessions = (onProgress) => this.sessionManager.usesDefaultSessionDir()
+                ? SessionManager.listAll(onProgress)
+                : SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress);
+            const selector = new SessionSelectorComponent((onProgress) => SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress), async (onProgress) => (await loadAllSessions(onProgress)).filter(inCurrentTree), loadAllSessions, async (sessionPath) => {
+''',
+        '''const inCurrentTree = (session) => {''',
+    ),
+]
+
+session_picker_text = texts[SESSION_PICKER]
+if '''import { resolve, sep } from "node:path";''' in session_picker_text and '''resolve as resolvePath''' not in session_picker_text:
+    session_picker_text = session_picker_text.replace('''import { resolve, sep } from "node:path";''', '''import { resolve as resolvePath, sep } from "node:path";''')
+    changed_paths.add(SESSION_PICKER)
+    print("patched session-picker.js bad path import")
+for old, new in [
+    ('''const currentCwd = cwd ? resolve(cwd) : undefined;''', '''const currentCwd = cwd ? resolvePath(cwd) : undefined;'''),
+    ('''const sessionCwd = resolve(session.cwd);''', '''const sessionCwd = resolvePath(session.cwd);'''),
+]:
+    if old in session_picker_text:
+        session_picker_text = session_picker_text.replace(old, new)
+        changed_paths.add(SESSION_PICKER)
+        print("patched session-picker.js shadowed resolve call")
+texts[SESSION_PICKER] = session_picker_text
+
+session_picker_patches = [
+    (
+        "path import",
+        '''import { setKeybindings } from "@earendil-works/pi-tui";
+''',
+        '''import { setKeybindings } from "@earendil-works/pi-tui";
+import { resolve as resolvePath, sep } from "node:path";
+''',
+        '''import { resolve as resolvePath, sep } from "node:path";''',
+    ),
+    (
+        "selectSession cwd argument",
+        '''export async function selectSession(currentSessionsLoader, allSessionsLoader, settingsManager) {
+    const ui = await createStartupTui(settingsManager);
+''',
+        '''export async function selectSession(currentSessionsLoader, allSessionsLoader, settingsManager, cwd) {
+    const ui = await createStartupTui(settingsManager);
+''',
+        '''selectSession(currentSessionsLoader, allSessionsLoader, settingsManager, cwd)''',
+    ),
+    (
+        "startup subtree loader",
+        '''        const selector = new SessionSelectorComponent(currentSessionsLoader, allSessionsLoader, (path) => {
+''',
+        '''        const currentCwd = cwd ? resolvePath(cwd) : undefined;
+        const subtreeSessionsLoader = async (onProgress) => {
+            const sessions = await allSessionsLoader(onProgress);
+            if (!currentCwd)
+                return sessions;
+            return sessions.filter((session) => {
+                const sessionCwd = resolvePath(session.cwd);
+                return sessionCwd === currentCwd || sessionCwd.startsWith(`${currentCwd}${sep}`);
+            });
+        };
+        const selector = new SessionSelectorComponent(currentSessionsLoader, subtreeSessionsLoader, allSessionsLoader, (path) => {
+''',
+        '''const subtreeSessionsLoader = async (onProgress) => {''',
+    ),
+]
+
+main_patches = [
+    (
+        "pass cwd to startup selector",
+        '''            const selectedPath = await selectSession((onProgress) => SessionManager.list(cwd, sessionDir, onProgress), (onProgress) => SessionManager.listAll(sessionDir, onProgress), settingsManager);
+''',
+        '''            const selectedPath = await selectSession((onProgress) => SessionManager.list(cwd, sessionDir, onProgress), (onProgress) => SessionManager.listAll(sessionDir, onProgress), settingsManager, cwd);
+''',
+        '''settingsManager, cwd);''',
+    ),
+]
+
+patch_file(SESSION_SELECTOR, selector_patches)
+if "createSessionCatalogBoundary" in texts[INTERACTIVE_MODE]:
+    print("skip interactive-mode.js subtree loader: session catalog boundary owns it")
+else:
+    patch_file(INTERACTIVE_MODE, interactive_patches)
+if "searchSessions" in texts[SESSION_PICKER]:
+    print("skip session-picker.js subtree loader: session catalog boundary owns it")
+else:
+    patch_file(SESSION_PICKER, session_picker_patches)
+if "createSessionCatalogBoundary" in texts[MAIN]:
+    print("skip main.js startup subtree loader: session catalog boundary owns it")
+else:
+    patch_file(MAIN, main_patches)
+
+for path in changed_paths:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf8") as handle:
+            handle.write(texts[path])
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, path.stat().st_mode)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+if changed_paths:
+    print("session selector subtree scope patch applied")
+else:
+    print("session selector subtree scope patch already present")

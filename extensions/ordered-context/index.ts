@@ -6,7 +6,7 @@ import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
 
 const CONTEXT_DIR = join(getAgentDir(), "CONTEXT");
 const MEMORY_NAME = /^\d+-MEMORY\.md$/i;
-const MEMORY_LIMIT_BYTES = 8 * 1024;
+const MEMORY_LIMIT_BYTES = 18 * 1024;
 const MEMORY_TRIM_WARNING_BYTES = MEMORY_LIMIT_BYTES * 1.1;
 const collator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 
@@ -29,7 +29,7 @@ function formatKiB(bytes: number) {
 
 async function memorySizeStatus(path: string) {
 	const { size } = await stat(path);
-	let status = `MEMORY.md: ${formatKiB(size)} / 8 KiB.`;
+	let status = `MEMORY.md: ${formatKiB(size)} / ${MEMORY_LIMIT_BYTES / 1024} KiB.`;
 	if (size <= MEMORY_TRIM_WARNING_BYTES) return status;
 
 	const text = await readFile(path, "utf8");
@@ -113,10 +113,16 @@ export default function orderedContext(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_result", (event, ctx) => {
-		if (event.toolName !== "edit" || event.isError) return;
+		if (event.isError || (event.toolName !== "edit" && event.toolName !== "read")) return;
 		const path = typeof event.input.path === "string" ? event.input.path : undefined;
 		if (!path || !isMemoryPath(path, ctx.cwd)) return;
 
+		if (event.toolName === "read") {
+			const sessionId = ctx.sessionManager.getSessionId();
+			if (!sessionId) return;
+			return { content: [...event.content, { type: "text" as const,
+				text: `Your own session ID for input into memory if YOU in this session have the knowledge: ${sessionId}` }] };
+		}
 		return memorySizeStatus(resolveToolPath(path, ctx.cwd)).then((status) => ({
 			content: [...event.content, { type: "text" as const, text: status }],
 		}));

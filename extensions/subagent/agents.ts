@@ -7,13 +7,14 @@ import * as path from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 export type AgentScope = "user" | "project" | "both";
-export type ModelSize = "big" | "small";
+export type ModelSize = "small" | "big" | "biggest";
+export const MODEL_SIZE_DESCRIPTION = "Model class. small = GPT-6 Luna/high for bulk or low-complexity discovery; big = GPT-6.1 Sol/low, the default for coding and general work; biggest = GPT-6.1 Sol/high for harder tasks. Template defaults apply when omitted; otherwise Sol/low. Pass useful Luna findings to Sol or the parent for synthesis.";
 export type AgentCapabilities = "general" | "research";
 export type AgentContextMode = "default" | "none" | "cwd-only";
 
 export const CAPABILITY_TOOLS: Record<AgentCapabilities, string[]> = {
-	general: ["read", "grep", "find", "ls", "bash", "search_session"],
-	research: ["read", "grep", "find", "ls", "bash", "edit", "write", "exa_search", "exa_answer", "search_session"],
+	general: ["read", "grep", "find", "ls", "bash", "grep_current_session", "grep_session_bank", "read_session", "ask_session", "search_context"],
+	research: ["read", "grep", "find", "ls", "bash", "edit", "write", "exa_search", "exa_answer", "grep_current_session", "grep_session_bank", "read_session", "ask_session", "search_context"],
 };
 
 export interface AgentConfig {
@@ -38,7 +39,7 @@ export interface AgentDiscoveryResult {
 }
 
 function modelSize(value: unknown): ModelSize | undefined {
-	return value === "big" || value === "small" ? value : undefined;
+	return value === "small" || value === "big" || value === "biggest" ? value : undefined;
 }
 
 function capabilities(value: unknown): AgentCapabilities | undefined {
@@ -92,7 +93,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			description: frontmatter.description,
 			tools,
 			model: frontmatter.model,
-			size: modelSize(frontmatter.size) ?? (frontmatter.model?.includes("luna") ? "small" : frontmatter.model?.includes("sol") ? "big" : undefined),
+			size: modelSize(frontmatter.size) ?? (frontmatter.model?.includes("luna") ? "small" : frontmatter.model?.includes("sol") ? "big" : frontmatter.model?.includes("astra") ? "biggest" : undefined),
 			capabilities: capability,
 			cwd: optionalString(frontmatter.cwd),
 			cwdBase: source === "project" ? path.dirname(path.dirname(dir)) : undefined,

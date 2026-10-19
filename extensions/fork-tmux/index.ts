@@ -1,7 +1,12 @@
-import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	SessionManager,
+	UserMessageSelectorComponent,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
@@ -10,11 +15,15 @@ import {
 	parseTmuxWindowIds,
 	piLaunchCommand,
 	prepareForkSession,
+	getForkableUserMessages,
+	type ForkableUserMessage,
 	type ForkSessionCopy,
 } from "./fork-tmux.js";
 
 type Dependencies = {
 	openSession(path: string, sessionDir: string): ForkSessionCopy;
+	createRootFork(cwd: string, sessionDir: string, parentSession: string): string | undefined;
+	selectMessage(ctx: ExtensionCommandContext, messages: ForkableUserMessage[]): Promise<string | undefined>;
 	fileExists(path: string): boolean;
 	removeFile(path: string): void;
 	createPromptFile(prompt: string): string;
@@ -26,8 +35,52 @@ type Dependencies = {
 	tmuxPane(): string | undefined;
 };
 
+export async function selectForkMessage(ctx: ExtensionCommandContext, messages: ForkableUserMessage[]) {
+	const initialSelectedId = messages[messages.length - 1]?.entryId;
+	return ctx.ui.custom<string | undefined>((tui, _theme, _keybindings, done) => {
+		const selector = new UserMessageSelectorComponent(
+			messages.map((message) => ({ id: message.entryId, text: message.text })),
+			done,
+			() => done(undefined),
+			initialSelectedId,
+		);
+		const list = selector.getMessageList();
+		return {
+			render: (width) => selector.render(width),
+			invalidate: () => selector.invalidate(),
+			handleInput: (data) => {
+				list.handleInput(data);
+				tui.requestRender();
+			},
+		};
+	});
+}
+
+export function createRootForkSession(cwd: string, sessionDir: string, parentSession: string) {
+	const session = SessionManager.create(cwd, sessionDir, { parentSession });
+	const path = session.getSessionFile();
+	const header = session.getHeader();
+	if (!path || !header) return undefined;
+	let fd: number | undefined;
+	let created = false;
+	try {
+		fd = openSync(path, "wx", 0o600);
+		created = true;
+		writeFileSync(fd, `${JSON.stringify(header)}\n`, "utf8");
+		closeSync(fd);
+		fd = undefined;
+		return path;
+	} catch (error) {
+		if (fd !== undefined) try { closeSync(fd); } catch {}
+		if (created) try { unlinkSync(path); } catch {}
+		throw error;
+	}
+}
+
 const DEFAULT_DEPENDENCIES: Dependencies = {
 	openSession: (path, sessionDir) => SessionManager.open(path, sessionDir),
+	createRootFork: createRootForkSession,
+	selectMessage: selectForkMessage,
 	fileExists: existsSync,
 	removeFile: unlinkSync,
 	createPromptFile: (prompt) => {
@@ -127,14 +180,21 @@ export function installForkTmux(pi: ExtensionAPI, overrides: Partial<Dependencie
 	pi.registerCommand("fork-tmux", {
 		description: "Fork the current conversation into the next tmux window and submit a message",
 		handler: async (args, ctx) => {
-			if (!args.trim()) {
-				ctx.ui.notify("Usage: /fork-tmux <message>", "warning");
-				return;
-			}
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/fork-tmux is available only in interactive TUI mode.", "error");
 				return;
 			}
+			let selectedEntryId: string | undefined;
+			if (!args.trim()) {
+				const messages = getForkableUserMessages(ctx.sessionManager);
+				if (messages.length === 0) {
+					ctx.ui.notify("No messages to fork from", "info");
+					return;
+				}
+				selectedEntryId = await dependencies.selectMessage(ctx, messages);
+				if (!selectedEntryId) return;
+			}
+
 			const pane = dependencies.tmuxPane();
 			if (!pane) {
 				ctx.ui.notify("/fork-tmux requires Pi to be running inside tmux.", "error");
@@ -178,8 +238,11 @@ export function installForkTmux(pi: ExtensionAPI, overrides: Partial<Dependencie
 			let fork;
 			let promptFile: string | undefined;
 			try {
-				fork = prepareForkSession(ctx.sessionManager, dependencies.openSession, dependencies.fileExists);
-				promptFile = dependencies.createPromptFile(args);
+				fork = prepareForkSession(ctx.sessionManager, dependencies.openSession, dependencies.fileExists, {
+					selectedEntryId,
+					createRootFork: dependencies.createRootFork,
+				});
+				promptFile = dependencies.createPromptFile(selectedEntryId ? fork.selectedText! : args);
 				dependencies.schedulePromptCleanup(promptFile);
 			} catch (error) {
 				if (fork) try { dependencies.removeFile(fork.forkFile); } catch {}

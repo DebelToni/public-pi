@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+
+TARGET = Path(os.environ.get(
+    "PI_BASH_TOOL_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/tools/bash.js",
+))
+text = TARGET.read_text("utf8")
+changed = False
+
+
+def replace_once(label: str, old: str, new: str, marker: str | None = None):
+    global text, changed
+    if marker and marker in text:
+        print(f"skip {label}: already patched")
+        return
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected one match, found {count}")
+    text = text.replace(old, new)
+    changed = True
+    print(f"patched {label}")
+
+
+replace_once(
+    "execute start timer",
+    '''            const resolvedCommand = commandPrefix ? `${commandPrefix}\\n${command}` : command;
+''',
+    '''            const startedAt = Date.now();
+            const elapsed = () => formatDuration(Date.now() - startedAt);
+            const resolvedCommand = commandPrefix ? `${commandPrefix}\\n${command}` : command;
+''',
+    '''const elapsed = () => formatDuration(Date.now() - startedAt);''',
+)
+
+replace_once(
+    "success timing helper",
+    '''            const appendStatus = (text, status) => `${text ? `${text}\\n\\n` : ""}${status}`;
+''',
+    '''            const appendStatus = (text, status) => `${text ? `${text}\\n\\n` : ""}${status}`;
+            const appendTiming = (text) => appendStatus(text, `Took ${elapsed()}`);
+''',
+    '''const appendTiming = (text) => appendStatus(text, `Took ${elapsed()}`);''',
+)
+
+desired_abort = '''Command aborted by the user after ${elapsed()}'''
+old_local_abort = '''Command aborted after ${elapsed()}'''
+if desired_abort in text:
+    print("skip abort timeout elapsed: already patched")
+elif text.count(old_local_abort) == 1:
+    text = text.replace(old_local_abort, desired_abort)
+    changed = True
+    print("migrated abort attribution")
+else:
+    replace_once(
+        "abort timeout elapsed",
+        '''                    if (err instanceof Error && err.message === "aborted") {
+                        throw new Error(appendStatus(text, "Command aborted"));
+                    }
+                    if (err instanceof Error && err.message.startsWith("timeout:")) {
+                        const timeoutSecs = err.message.split(":")[1];
+                        throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+                    }
+''',
+        '''                    if (err instanceof Error && err.message === "aborted") {
+                        throw new Error(appendStatus(text, `Command aborted by the user after ${elapsed()}`));
+                    }
+                    if (err instanceof Error && err.message.startsWith("timeout:")) {
+                        const timeoutSecs = err.message.split(":")[1];
+                        throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds (elapsed ${elapsed()})`));
+                    }
+''',
+        desired_abort,
+    )
+
+replace_once(
+    "exit success elapsed",
+    '''                if (exitCode !== 0 && exitCode !== null) {
+                    throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
+                }
+                return { content: [{ type: "text", text: outputText }], details };
+''',
+    '''                if (exitCode !== 0 && exitCode !== null) {
+                    throw new Error(appendStatus(outputText, `Command exited with code ${exitCode} after ${elapsed()}`));
+                }
+                return { content: [{ type: "text", text: appendTiming(outputText) }], details };
+''',
+    '''Command exited with code ${exitCode} after ${elapsed()}''',
+)
+
+if "function formatShellCall(args, prompt)" in text and "function stripModelOnlyTimingForDisplay(output)" not in text:
+    anchor = "function rebuildBashResultRenderComponent(component, result, options, showImages, startedAt, endedAt) {"
+    if text.count(anchor) != 1:
+        raise RuntimeError("display timing stripper: expected one shell-render anchor")
+    helper = '''function stripModelOnlyTimingForDisplay(output) {
+    return output
+        .replace(/\\n\\nTook \\d+\\.\\ds$/, "")
+        .replace(/Command aborted by the user after \\d+\\.\\ds$/, "Command aborted")
+        .replace(/Command exited with code (\\d+) after \\d+\\.\\ds$/, "Command exited with code $1")
+        .replace(/Command timed out after ([\\d.]+) seconds \\(elapsed \\d+\\.\\ds\\)$/, "Command timed out after $1 seconds");
+}
+'''
+    text = text.replace(anchor, helper + anchor)
+    changed = True
+    print("patched display timing stripper for shared shell renderer")
+
+replace_once(
+    "display timing stripper",
+    '''function formatBashCall(args) {
+    const command = str(args?.command);
+    const timeout = args?.timeout;
+    const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
+    const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
+    return theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`)) + timeoutSuffix;
+}
+function rebuildBashResultRenderComponent(component, result, options, showImages, startedAt, endedAt) {
+''',
+    '''function formatBashCall(args) {
+    const command = str(args?.command);
+    const timeout = args?.timeout;
+    const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
+    const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
+    return theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`)) + timeoutSuffix;
+}
+function stripModelOnlyTimingForDisplay(output) {
+    return output
+        .replace(/\\n\\nTook \\d+\\.\\ds$/, "")
+        .replace(/Command aborted by the user after \\d+\\.\\ds$/, "Command aborted")
+        .replace(/Command exited with code (\\d+) after \\d+\\.\\ds$/, "Command exited with code $1")
+        .replace(/Command timed out after ([\\d.]+) seconds \\(elapsed \\d+\\.\\ds\\)$/, "Command timed out after $1 seconds");
+}
+function rebuildBashResultRenderComponent(component, result, options, showImages, startedAt, endedAt) {
+''',
+    '''function stripModelOnlyTimingForDisplay(output)''',
+)
+
+old_abort_display_strip = '''.replace(/Command aborted after \\d+\\.\\ds$/, "Command aborted")'''
+desired_abort_display_strip = '''.replace(/Command aborted by the user after \\d+\\.\\ds$/, "Command aborted")'''
+if desired_abort_display_strip in text:
+    print("skip abort display attribution: already patched")
+elif text.count(old_abort_display_strip) == 1:
+    text = text.replace(old_abort_display_strip, desired_abort_display_strip)
+    changed = True
+    print("migrated abort display attribution")
+else:
+    raise RuntimeError("abort display attribution: expected one display-strip marker")
+
+original_display_block = '''    if (!options.isPartial && truncation?.truncated && fullOutputPath && output.endsWith("]")) {
+        const footerStart = output.lastIndexOf("\\n\\n[");
+        if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
+            output = output.slice(0, footerStart).trimEnd();
+        }
+    }
+    if (output) {
+'''
+old_success_only_block = '''    if (!options.isPartial && truncation?.truncated && fullOutputPath && output.endsWith("]")) {
+        const footerStart = output.lastIndexOf("\\n\\n[");
+        if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
+            output = output.slice(0, footerStart).trimEnd();
+        }
+    }
+    if (!options.isPartial) {
+        output = output.replace(/\\n\\nTook \\d+\\.\\ds$/, "");
+    }
+    if (output) {
+'''
+model_only_display_block = '''    if (!options.isPartial && truncation?.truncated && fullOutputPath && output.endsWith("]")) {
+        const footerStart = output.lastIndexOf("\\n\\n[");
+        if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
+            output = output.slice(0, footerStart).trimEnd();
+        }
+    }
+    if (!options.isPartial) {
+        output = stripModelOnlyTimingForDisplay(output);
+    }
+    if (output) {
+'''
+if '''output = stripModelOnlyTimingForDisplay(output);''' in text:
+    print("skip hide model-only timing: already patched")
+elif text.count(old_success_only_block) == 1:
+    text = text.replace(old_success_only_block, model_only_display_block)
+    changed = True
+    print("patched hide model-only timing")
+elif text.count(original_display_block) == 1:
+    text = text.replace(original_display_block, model_only_display_block)
+    changed = True
+    print("patched hide model-only timing")
+else:
+    raise RuntimeError("hide model-only timing: expected one display block")
+
+if changed:
+    TARGET.write_text(text, "utf8")
+    print(f"wrote {TARGET}")
+else:
+    print("bash tool elapsed result patch already present")

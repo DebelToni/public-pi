@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Manage RunPod GPU pods using the GeneralContainer template."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+from datetime import datetime
+from pathlib import Path
+from typing import Any, NoReturn
+
+
+TEMPLATE_ID = "7488fg5mzu"
+AUTO_GPUS = [
+    "NVIDIA RTX 2000 Ada Generation",
+    "NVIDIA RTX 4000 Ada Generation",
+    "NVIDIA L4",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 5090",
+]
+ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SENSITIVE = ("ACCESS_KEY", "SECRET", "TOKEN", "AUTHKEY", "PASSWORD")
+SECRET_REFERENCE = re.compile(r"^\{\{\s*RUNPOD_SECRET_[A-Za-z0-9_-]+\s*\}\}$")
+UNAVAILABLE = re.compile(
+    r"(?:not available|unavailable|insufficient.*capacity|out of stock|no .*gpu)",
+    re.IGNORECASE,
+)
+
+
+def die(message: str) -> NoReturn:
+    raise SystemExit(f"[runpod-gpu] {message}")
+
+
+def json_command(command: list[str]) -> Any:
+    try:
+        result = subprocess.run(command, check=True, text=True, capture_output=True)
+    except FileNotFoundError:
+        die(f"missing command: {command[0]}")
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or error.stdout).strip()
+        die(detail or f"failed: {shlex.join(command)}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        die(f"invalid JSON from {shlex.join(command)}: {error}")
+
+
+def assignment(text: str) -> tuple[str, str]:
+    if "=" not in text:
+        die(f"expected KEY=VALUE: {text}")
+    key, value = text.split("=", 1)
+    key = key.strip()
+    if not ENV_KEY.fullmatch(key):
+        die(f"invalid environment name: {key}")
+    return key, value
+
+
+def env_file(path: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        lines = Path(path).expanduser().read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        die(f"cannot read {path}: {error}")
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            die(f"{path}:{number}: expected KEY=VALUE")
+        key, value = assignment(line)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        # Blank placeholders do not erase RunPod secret references from the template.
+        if value:
+            result[key] = value
+    return result
+
+
+def credentialed_url(value: str) -> bool:
+    if "://" not in value:
+        return False
+    parsed = urllib.parse.urlsplit(value)
+    return parsed.username is not None or parsed.password is not None
+
+
+def repo_url(value: str) -> str:
+    value = value.strip()
+    if value == ".":
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"], text=True, capture_output=True
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            die("--repo . requires a Git remote named origin")
+        value = result.stdout.strip()
+    if credentialed_url(value):
+        die("repository URLs must not contain credentials")
+    if "://" in value or value.startswith("git@"):
+        return value
+    short = re.fullmatch(r"([^/\s]+)/([^/\s]+?)(?:\.git)?", value)
+    if short:
+        return f"https://github.com/{short.group(1)}/{short.group(2)}.git"
+    die("invalid repository URL")
+
+
+def s3_uri(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not value:
+        die("bucket cannot be empty")
+    return value if value.startswith("s3://") else f"s3://{value}"
+
+
+def validate_custom_environment(values: dict[str, str], source: str) -> None:
+    for key, value in values.items():
+        if not SECRET_REFERENCE.fullmatch(value):
+            die(f"{source}: {key} must use a {{{{ RUNPOD_SECRET_name }}}} reference")
+
+
+def validate_merged_environment(env: dict[str, str]) -> None:
+    for key, value in env.items():
+        if any(part in key.upper() for part in SENSITIVE) and not SECRET_REFERENCE.fullmatch(value):
+            die(f"{key} must use a RunPod secret reference")
+        if credentialed_url(value):
+            die(f"{key} must not contain URL credentials")
+
+
+def merged_environment(args: argparse.Namespace, template: dict[str, Any]) -> dict[str, str]:
+    raw = template.get("env") or {}
+    if not isinstance(raw, dict):
+        die("template environment is not an object")
+    env = {str(key): str(value) for key, value in raw.items()}
+    for path in args.env_file:
+        values = env_file(path)
+        validate_custom_environment(values, path)
+        env.update(values)
+    if args.repo:
+        env["GIT_REPO_URL"] = repo_url(args.repo)
+    if args.bucket:
+        env["S3_URI"] = s3_uri(args.bucket)
+    if args.sync_dirs is not None:
+        env["SYNC_DIRS"] = args.sync_dirs
+    env["TS_HOSTNAME"] = args.ts_hostname or args.name
+    if args.force_sync:
+        env["FORCE_SYNC"] = "1"
+    for item in args.env:
+        key, value = assignment(item)
+        validate_custom_environment({key: value}, "--env")
+        env[key] = value
+    validate_merged_environment(env)
+    return env
+
+
+def gpu_candidates(requested: str) -> list[str]:
+    if requested != "auto":
+        return [requested]
+    catalog = json_command(["runpodctl", "gpu", "list", "-o", "json"])
+    available = {
+        item.get("gpuId")
+        for item in catalog
+        if isinstance(item, dict) and item.get("available") and item.get("secureCloud")
+    }
+    candidates = [gpu for gpu in AUTO_GPUS if gpu in available]
+    if not candidates:
+        die("none of the preferred Secure Cloud GPUs is available")
+    return candidates
+
+
+def create_command(args: argparse.Namespace, gpu: str, env: dict[str, str]) -> list[str]:
+    return [
+        "runpodctl", "pod", "create",
+        "--template-id", args.template_id,
+        "--name", args.name,
+        "--gpu-id", gpu,
+        "--gpu-count", str(args.gpu_count),
+        "--cloud-type", "SECURE",
+        "--env", json.dumps(env, separators=(",", ":"), sort_keys=True),
+        "-o", "json",
+    ]
+
+
+def pod_id(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    for key in ("id", "podId"):
+        if response.get(key):
+            return str(response[key])
+    for key in ("pod", "data"):
+        found = pod_id(response.get(key))
+        if found:
+            return found
+    return ""
+
+
+def pod_name(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    for key in ("name", "podName"):
+        if response.get(key):
+            return str(response[key])
+    return ""
+
+
+def pod_catalog() -> list[dict[str, Any]]:
+    response = json_command(["runpodctl", "pod", "list", "-o", "json"])
+    if not isinstance(response, list):
+        die("unexpected pod list response")
+    return [item for item in response if isinstance(item, dict)]
+
+
+def recover_created_pod(name: str, before: set[str]) -> str:
+    for attempt in range(6):
+        matches = [
+            pod_id(item)
+            for item in pod_catalog()
+            if pod_name(item) == name and pod_id(item) not in before
+        ]
+        matches = [identifier for identifier in matches if identifier]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            die(f"multiple new pods named {name}; inspect them with runpod-gpu list")
+        if attempt < 5:
+            time.sleep(1)
+    return ""
+
+
+def redacted_output(text: str, env: dict[str, str]) -> str:
+    env_json = json.dumps(env, separators=(",", ":"), sort_keys=True)
+    values = {env_json, *(value for value in env.values() if value)}
+    for value in sorted(values, key=len, reverse=True):
+        text = text.replace(value, "<redacted>")
+        text = text.replace(json.dumps(value)[1:-1], "<redacted>")
+    return text
+
+
+def create(args: argparse.Namespace) -> int:
+    template = json_command(["runpodctl", "template", "get", args.template_id, "-o", "json"])
+    if not isinstance(template, dict):
+        die("unexpected template response")
+    env = merged_environment(args, template)
+    candidates = gpu_candidates(args.gpu)
+
+    if args.dry_run:
+        safe_env = {key: "<set>" for key in sorted(env)}
+        print(json.dumps({
+            "template": {
+                "label": "GeneralContainer",
+                "id": args.template_id,
+                "runpodName": template.get("name"),
+                "image": template.get("imageName"),
+            },
+            "gpuCandidates": candidates,
+            "environment": safe_env,
+        }, indent=2))
+        return 0
+
+    if args.wait and not shutil.which("runpod-pod-ready-check"):
+        die("--wait requires runpod-pod-ready-check on PATH")
+
+    before = {pod_id(item) for item in pod_catalog() if pod_id(item)}
+    last_error = ""
+    for gpu in candidates:
+        print(f"[runpod-gpu] trying gpu={gpu} template={args.template_id}", file=sys.stderr)
+        try:
+            result = subprocess.run(create_command(args, gpu, env), text=True, capture_output=True)
+        except FileNotFoundError:
+            die("missing command: runpodctl")
+        if result.returncode != 0:
+            last_error = redacted_output((result.stderr or result.stdout).strip(), env)
+            if args.gpu != "auto" or not UNAVAILABLE.search(last_error):
+                recovered = recover_created_pod(args.name, before)
+                if recovered:
+                    identifier = recovered
+                    break
+                die(last_error or f"creation failed for {gpu}; inspect pods named {args.name}")
+            print(f"[runpod-gpu] unavailable: {gpu}", file=sys.stderr)
+            continue
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            response = None
+        identifier = pod_id(response)
+        if not identifier:
+            identifier = recover_created_pod(args.name, before)
+            if not identifier:
+                die(f"create response had no pod ID; inspect pods named {args.name}")
+        break
+    else:
+        die(last_error or "creation failed for every preferred GPU")
+
+    if args.id_only:
+        print(identifier)
+    else:
+        print(f"[runpod-gpu] pod_id={identifier} name={args.name} gpu={gpu} status=CREATED")
+    if args.wait:
+        return subprocess.run(["runpod-pod-ready-check", identifier]).returncode
+    return 0
+
+
+def passthrough(command: list[str]) -> int:
+    try:
+        return subprocess.run(command).returncode
+    except FileNotFoundError:
+        die(f"missing command: {command[0]}")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="runpod-gpu", description="Manage GeneralContainer RunPod pods.")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    new = commands.add_parser("create", help="Create a Secure Cloud GPU pod.")
+    new.add_argument("--name", default=f"gpu-pod-{datetime.now():%m%d-%H%M%S}")
+    new.add_argument("--gpu", default="auto", help="Exact RunPod GPU ID or auto.")
+    new.add_argument("--gpu-count", type=int, default=1)
+    new.add_argument("--template-id", default=os.environ.get("RUNPOD_TEMPLATE_ID", TEMPLATE_ID))
+    new.add_argument("--repo", help="Git URL, OWNER/REPO, or . for the current origin.")
+    new.add_argument("--bucket", help="Bucket name or s3://bucket/prefix.")
+    new.add_argument("--sync-dirs", help="Comma-separated prefixes/files.")
+    new.add_argument("--ts-hostname")
+    new.add_argument("--force-sync", action="store_true")
+    new.add_argument(
+        "--env-file", action="append", default=[], metavar="PATH",
+        help="File of KEY={{ RUNPOD_SECRET_name }} references; repeatable.",
+    )
+    new.add_argument(
+        "--env", action="append", default=[], metavar="KEY=SECRET_REF",
+        help="Extra RunPod secret reference; repeatable.",
+    )
+    new.add_argument("--wait", action="store_true")
+    new.add_argument("--id-only", action="store_true")
+    new.add_argument("--dry-run", action="store_true")
+    new.set_defaults(handler=create)
+
+    listing = commands.add_parser("list", help="List running pods.")
+    listing.set_defaults(handler=lambda _: passthrough(["runpodctl", "pod", "list", "-o", "json"]))
+    for name, runpod_action in (("stop", "stop"), ("remove", "delete")):
+        command = commands.add_parser(name, help=f"{name.title()} a pod.")
+        command.add_argument("pod_id")
+        command.set_defaults(handler=lambda args, action=runpod_action: passthrough(
+            ["runpodctl", "pod", action, args.pod_id, "-o", "json"]
+        ))
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if getattr(args, "gpu_count", 1) < 1:
+        die("--gpu-count must be at least 1")
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

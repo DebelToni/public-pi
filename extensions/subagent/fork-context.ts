@@ -13,6 +13,7 @@ export type ForkMode =
 export interface TemporaryForkSession {
 	dir: string;
 	filePath: string;
+	sessionId?: string;
 }
 
 export interface ResumableForkSession extends TemporaryForkSession {
@@ -89,7 +90,7 @@ async function writeForkSession(
 	messages: AgentMessage[],
 	parentSessionFile: string | undefined,
 	baselineEntryId?: string,
-): Promise<string> {
+): Promise<{ filePath: string; sessionId: string }> {
 	const filePath = path.join(dir, "session.jsonl");
 	const sessionId = randomUUID();
 	const timestamp = new Date().toISOString();
@@ -164,7 +165,7 @@ async function writeForkSession(
 		await handle.close();
 	}
 	await syncDirectory(dir);
-	return filePath;
+	return { filePath, sessionId };
 }
 
 export async function writeTemporaryForkSession(
@@ -175,7 +176,7 @@ export async function writeTemporaryForkSession(
 	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-session-"));
 	try {
 		await fs.promises.chmod(dir, 0o700);
-		return { dir, filePath: await writeForkSession(dir, cwd, messages, parentSessionFile) };
+		return { dir, ...await writeForkSession(dir, cwd, messages, parentSessionFile) };
 	} catch (error) {
 		await fs.promises.rm(dir, { recursive: true, force: true });
 		throw error;
@@ -195,9 +196,9 @@ export async function writeResumableForkSession(
 	const dir = path.join(root, runId);
 	await fs.promises.mkdir(dir, { mode: 0o700 });
 	try {
-		const filePath = await writeForkSession(dir, cwd, messages, parentSessionFile, baselineEntryId);
+		const session = await writeForkSession(dir, cwd, messages, parentSessionFile, baselineEntryId);
 		await syncDirectory(root);
-		return { runId, dir, filePath, baselineEntryId };
+		return { runId, dir, ...session, baselineEntryId };
 	} catch (error) {
 		await fs.promises.rm(dir, { recursive: true, force: true });
 		throw error;
@@ -231,7 +232,7 @@ export async function cloneResumableForkSession(
 		}
 		await syncDirectory(dir);
 		await syncDirectory(root);
-		return { runId, dir, filePath, baselineEntryId: source.baselineEntryId };
+		return { runId, dir, filePath, sessionId: source.sessionId, baselineEntryId: source.baselineEntryId };
 	} catch (error) {
 		await fs.promises.rm(dir, { recursive: true, force: true });
 		throw error;

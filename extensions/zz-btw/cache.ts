@@ -14,6 +14,14 @@ export type CacheUsage = {
 	cost: { total: number };
 };
 
+export const CACHE_FRESHNESS_MS = 5 * 60_000;
+export const MIN_EXACT_PARENT_PROMPT_TOKENS = 1_024;
+export const MIN_CONFIRMED_PARENT_CACHE_COVERAGE = 0.9;
+
+export type CacheFreshness =
+	| { ok: true; ageMs: number }
+	| { ok: false; ageMs: number; reason: "future" | "expired" };
+
 export class CacheSafetyError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -71,8 +79,7 @@ export function buildCacheForkPayload(parentPayload: unknown, candidatePayload: 
 	const payload = cloneValue(parentPayload);
 	payload.input = cloneValue(candidatePayload.input);
 	payload.prompt_cache_key = cacheKey;
-	payload.store = false;
-	payload.stream = true;
+	payload.tool_choice = "none";
 
 	return {
 		payload,
@@ -94,6 +101,37 @@ export function roughSharedTokenEstimate(payload: unknown): number {
 export function cacheHitRatio(usage: Pick<CacheUsage, "input" | "cacheRead" | "cacheWrite">): number {
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	return promptTokens > 0 ? usage.cacheRead / promptTokens : 0;
+}
+
+export function cacheFreshness(requestStartedAt: number, now: number): CacheFreshness {
+	const ageMs = now - requestStartedAt;
+	if (!Number.isFinite(requestStartedAt) || !Number.isFinite(now) || ageMs < 0) {
+		return { ok: false, ageMs, reason: "future" };
+	}
+	if (ageMs >= CACHE_FRESHNESS_MS) return { ok: false, ageMs, reason: "expired" };
+	return { ok: true, ageMs };
+}
+
+export function confirmedParentCacheCoverage(parentPromptTokens: number, cacheReadTokens: number): number {
+	if (parentPromptTokens <= 0 || cacheReadTokens <= 0) return 0;
+	return Math.min(cacheReadTokens, parentPromptTokens) / parentPromptTokens;
+}
+
+export function exactParentPromptProblem(parentPromptTokens: number): string | undefined {
+	if (parentPromptTokens >= MIN_EXACT_PARENT_PROMPT_TOKENS) return undefined;
+	return `The exact parent prompt is only ${parentPromptTokens} tokens; at least ${MIN_EXACT_PARENT_PROMPT_TOKENS} are required.`;
+}
+
+export function confirmedCacheProblem(parentPromptTokens: number, cacheReadTokens: number): string | undefined {
+	const promptProblem = exactParentPromptProblem(parentPromptTokens);
+	if (promptProblem) return promptProblem;
+	const coverage = confirmedParentCacheCoverage(parentPromptTokens, cacheReadTokens);
+	if (coverage < MIN_CONFIRMED_PARENT_CACHE_COVERAGE) {
+		return cacheReadTokens === 0
+			? "The provider reported a parent cache miss."
+			: `The provider confirmed only ${(coverage * 100).toFixed(2)}% parent cache coverage; at least 90% is required.`;
+	}
+	return undefined;
 }
 
 export function formatTokens(value: number): string {

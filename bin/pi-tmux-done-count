@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Compatibility guard for Pi runtimes loaded before the global counter was disabled.
+set -uo pipefail
+
+right="$(tmux show-options -gqv status-right 2>/dev/null || true)"
+marker='#{@pi_done_count}'
+if [[ "$right" == *"$marker"* ]]; then
+	after_marker="${right#*"$marker"}"
+	remainder="${after_marker#*" "}"
+	if [[ "$remainder" != "$after_marker" ]]; then
+		tmux set-option -gq status-right "$remainder" 2>/dev/null || true
+	fi
+fi
+for hook in 'window-linked[987]' 'window-unlinked[987]' 'session-closed[987]'; do
+	tmux set-hook -g -u "$hook" 2>/dev/null || true
+done
+tmux set-option -g -u @pi_done_count 2>/dev/null || true
+while IFS= read -r client; do
+	[ -n "$client" ] && tmux refresh-client -S -t "$client" 2>/dev/null || true
+done < <(tmux list-clients -F '#{client_name}' 2>/dev/null || true)

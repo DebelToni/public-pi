@@ -1,0 +1,168 @@
+#!/usr/bin/env node
+import path from "node:path";
+import {
+	catalogStatus,
+	defaultCatalogPath,
+	defaultSessionsRoot,
+	extractCatalogImage,
+	inspectCatalogSession,
+	listCatalogSessions,
+	readCatalogSession,
+	rebuildFts,
+	reconcileCatalog,
+	searchCatalog,
+	verifyCatalog,
+} from "../lib/session-catalog/index.mjs";
+
+function usage(error = false) {
+	const text = `Usage:
+  pi-session-catalog reconcile (--path FILE | --cwd PATH | --all) [options]
+  pi-session-catalog list [--cwd PATH] [--tree] [--limit N] [options]
+  pi-session-catalog search QUERY [--mode bm25|phrase|regex] [--cwd PATH | --path FILE [--leaf ID]] [options]
+  pi-session-catalog inspect (--path FILE | --id SESSION_ID) [options]
+  pi-session-catalog read --path FILE [--entry ID] [--leaf ID] [--before N] [--after N] [options]
+  pi-session-catalog image --path FILE --entry ID --part N --output FILE [options]
+  pi-session-catalog verify (--path FILE | --cwd PATH | --all) [options]
+  pi-session-catalog status [options]
+  pi-session-catalog rebuild-fts [options]
+
+Options:
+  --database PATH       SQLite store (default: adjacent cache/session-store.sqlite3)
+  --sessions-root PATH  Pi JSONL root (default: ~/.pi/agent/sessions)
+  --cwd PATH            Exact project cwd
+  --tree                Include cwd descendants
+  --all                 Reconcile/verify every bucket
+  --path PATH           Exact authoritative JSONL file
+  --id SESSION_ID       Exact session ID for inspect
+  --leaf ID             Exact persisted leaf for path search/read
+  --entry ID            Read/image anchor entry
+  --byte-start N        Compatibility locator (entry when present, otherwise leaf)
+  --entry-byte-start N  Exact source locator for --entry
+  --leaf-byte-start N   Exact source locator for --leaf
+  --limit N             Session or read-entry result limit
+  --mode MODE           bm25, phrase, or regex
+  --sort MODE           relevance (default) or recent
+  --title-first         BM25: fuzzy named-title matches before other hits, even with recent sort
+  --named-only          Only manually named sessions
+  --no-metadata         Disable broad session metadata search lane
+  --role ROLE           Repeatable entry role filter
+  --type TYPE           Repeatable entry type filter
+  --include-tools       Include bounded tool evidence in search
+  --matches N           Excerpt matches per session (default 1, max 50)
+  --since-hours HOURS   Only sessions modified within this many hours
+  --include-text        List-only compatibility experiment; bounded
+  --max-chars N         Bound read/list textual output
+  --allow-partial       Continue global/cwd list/search with fresh rows and coverage
+  --allow-stale         Explicitly permit stale metadata/read output
+  --integrity           Run full SQLite integrity_check for status
+  --compact             Emit compact JSON`;
+	(error ? console.error : console.log)(text);
+	process.exit(error ? 2 : 0);
+}
+
+function parse(argv) {
+	const command = argv.shift();
+	if (!command || command === "--help" || command === "-h") usage(false);
+	const options = { roles: [], types: [] }, positional = [];
+	const boolean = new Set(["all", "tree", "named-only", "title-first", "no-metadata", "compact", "include-tools", "include-text", "allow-stale", "allow-partial", "integrity"]);
+	while (argv.length) {
+		const arg = argv.shift();
+		if (arg === "--") { positional.push(...argv); break; }
+		if (!arg.startsWith("--")) { positional.push(arg); continue; }
+		const key = arg.slice(2);
+		if (boolean.has(key)) { options[key.replaceAll("-", "_")] = true; continue; }
+		const value = argv.shift();
+		if (value === undefined) throw new Error(`missing value for ${arg}`);
+		if (key === "role") options.roles.push(value);
+		else if (key === "type") options.types.push(value);
+		else options[key.replaceAll("-", "_")] = value;
+	}
+	return { command, options, positional };
+}
+
+function numeric(value, label) {
+	if (value === undefined) return undefined;
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative integer`);
+	return parsed;
+}
+
+function nonNegative(value, label) {
+	if (value === undefined) return undefined;
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative finite number`);
+	return parsed;
+}
+
+function common(options) {
+	const explicitSessionsRoot = options.sessions_root ? path.resolve(options.sessions_root) : undefined;
+	const defaultRoot = defaultSessionsRoot();
+	const sessionsRoot = explicitSessionsRoot ?? (options.database ? undefined : defaultRoot);
+	return {
+		sessionsRoot,
+		databasePath: path.resolve(options.database ?? defaultCatalogPath(sessionsRoot ?? defaultRoot)),
+		cwd: options.cwd ? path.resolve(options.cwd) : undefined,
+		path: options.path ? path.resolve(options.path) : undefined,
+		leaf: options.leaf, byteStart: numeric(options.byte_start, "--byte-start"),
+		entryByteStart: numeric(options.entry_byte_start, "--entry-byte-start"),
+		leafByteStart: numeric(options.leaf_byte_start, "--leaf-byte-start"), sinceHours: nonNegative(options.since_hours, "--since-hours"),
+		all: Boolean(options.all), tree: Boolean(options.tree), namedOnly: Boolean(options.named_only), metadata: options.no_metadata ? false : undefined,
+		includeTools: Boolean(options.include_tools), includeText: Boolean(options.include_text),
+		allowStale: Boolean(options.allow_stale), allowPartial: Boolean(options.allow_partial), integrity: Boolean(options.integrity),
+		roles: options.roles, types: options.types, sort: options.sort, titleFirst: Boolean(options.title_first),
+		limit: numeric(options.limit, "--limit"), matchLimit: numeric(options.matches, "--matches"),
+		maxChars: numeric(options.max_chars, "--max-chars"),
+	};
+}
+
+function output(value, compact) { console.log(JSON.stringify(value, null, compact ? 0 : 2)); }
+
+async function main() {
+	const { command, options, positional } = parse(process.argv.slice(2));
+	const base = common(options);
+	const controller = new AbortController();
+	process.once("SIGINT", () => controller.abort());
+	process.once("SIGTERM", () => controller.abort());
+	let result;
+	switch (command) {
+		case "reconcile":
+			if (!base.path && !base.all && !base.cwd) throw new Error("reconcile requires --path, --cwd, or --all");
+			result = await reconcileCatalog({ ...base, signal: controller.signal }); break;
+		case "list": {
+			const results = listCatalogSessions(base); result = { results, coverage: results.coverage }; break;
+		}
+		case "search": {
+			const query = positional.join(" ").trim();
+			if (!query) throw new Error("search requires a query");
+			const mode = options.mode ?? "bm25";
+			if (!["bm25", "phrase", "regex"].includes(mode)) throw new Error(`unknown search mode: ${mode}`);
+			if (base.sort && !["relevance", "recent"].includes(base.sort)) throw new Error(`unknown search sort: ${base.sort}`);
+			result = searchCatalog(query, { ...base, mode }); break;
+		}
+		case "inspect":
+			if (Number(Boolean(base.path)) + Number(Boolean(options.id)) !== 1) throw new Error("inspect requires exactly one of --path or --id");
+			result = inspectCatalogSession({ ...base, id: options.id }); break;
+		case "read":
+			if (!base.path) throw new Error("read requires --path");
+			result = readCatalogSession({ ...base, entry: options.entry, leaf: options.leaf,
+				before: numeric(options.before, "--before"), after: numeric(options.after, "--after") }); break;
+		case "image":
+			if (!base.path || !options.entry || options.part === undefined || !options.output) throw new Error("image requires --path, --entry, --part, and --output");
+			result = await extractCatalogImage({ ...base, entry: options.entry, part: numeric(options.part, "--part"), output: path.resolve(options.output) }); break;
+		case "verify":
+			if (!base.path && !base.all && !base.cwd) throw new Error("verify requires --path, --cwd, or --all");
+			result = await verifyCatalog({ ...base, signal: controller.signal }); break;
+		case "status": result = catalogStatus(base); break;
+		case "rebuild-fts": result = rebuildFts(base); break;
+		default: usage(true);
+	}
+	output(result, options.compact);
+	if (command === "reconcile" && result?.scopeComplete === false) process.exitCode = 2;
+	else if (result?.failed || result?.ok === false || result?.scopeComplete === false) process.exitCode = 1;
+}
+
+main().catch((error) => {
+	console.error(`pi-session-catalog: ${error instanceof Error ? error.message : String(error)}`);
+	if (error?.failures) console.error(JSON.stringify({ failures: error.failures }));
+	process.exitCode = error?.name === "AbortError" ? 130 : 1;
+});

@@ -1,20 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	CACHE_FRESHNESS_MS,
 	CacheSafetyError,
 	buildCacheForkPayload,
+	cacheFreshness,
 	cacheHitRatio,
+	confirmedCacheProblem,
+	confirmedParentCacheCoverage,
 	formatUsage,
 	promptCacheKey,
 	roughSharedTokenEstimate,
 } from "./cache.ts";
 
 const parent = {
-	model: "gpt-5.6-sol",
+	model: "gpt-6-sol",
 	instructions: "stable system",
 	input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "parent" }] }],
 	tools: [{ type: "function", name: "read" }],
 	prompt_cache_key: "parent-session",
+	tool_choice: "auto",
 	service_tier: "priority",
 	store: false,
 	stream: true,
@@ -38,9 +43,13 @@ test("fork payload preserves the parent body and only extends input", () => {
 
 	assert.deepEqual(parent, originalParent);
 	assert.equal(result.payload.prompt_cache_key, "parent-session");
+	assert.equal(result.payload.tool_choice, "none");
 	assert.equal(result.payload.service_tier, "priority");
 	assert.deepEqual(result.payload.tools, parent.tools);
 	assert.deepEqual((result.payload.input as unknown[]).slice(0, parent.input.length), parent.input);
+	const { input: _parentInput, tool_choice: _parentToolChoice, ...parentBody } = parent;
+	const { input: _sideInput, tool_choice: _sideToolChoice, ...sideBody } = result.payload;
+	assert.deepEqual(sideBody, parentBody);
 	assert.equal(result.sharedInputItems, 1);
 	assert.equal(result.suffixInputItems, 2);
 });
@@ -111,6 +120,46 @@ test("cache telemetry reports hit ratio, writes, and cost", () => {
 	const usage = { input: 258, output: 19, cacheRead: 1536, cacheWrite: 128, cost: { total: 0.002628 } };
 	assert.equal(cacheHitRatio(usage), 1536 / 1922);
 	assert.equal(formatUsage(usage), "in 258 · cache 1.5k (80%) · write 128 · out 19 · $0.0026");
+});
+
+test("cache freshness rejects future timestamps and the exact five-minute boundary", () => {
+	assert.deepEqual(cacheFreshness(10_001, 10_000), { ok: false, ageMs: -1, reason: "future" });
+	assert.deepEqual(cacheFreshness(10_000, 10_000 + CACHE_FRESHNESS_MS - 1), {
+		ok: true,
+		ageMs: CACHE_FRESHNESS_MS - 1,
+	});
+	assert.deepEqual(cacheFreshness(10_000, 10_000 + CACHE_FRESHNESS_MS), {
+		ok: false,
+		ageMs: CACHE_FRESHNESS_MS,
+		reason: "expired",
+	});
+});
+
+test("confirmed cache coverage is measured against exact parent prompt tokens", () => {
+	assert.equal(confirmedParentCacheCoverage(2_000, 1_800), 0.9);
+	assert.equal(confirmedParentCacheCoverage(2_000, 4_000), 1);
+	assert.equal(confirmedCacheProblem(2_000, 1_800), undefined);
+	assert.match(confirmedCacheProblem(2_000, 1_799) ?? "", /parent cache coverage/);
+	assert.match(confirmedCacheProblem(2_000, 0) ?? "", /cache miss/);
+	assert.match(confirmedCacheProblem(1_023, 1_023) ?? "", /at least 1024/);
+});
+
+test("dispatch recheck catches expiry after a successful turn preflight", () => {
+	const confirmedRequestStartedAt = 5_000;
+	assert.equal(cacheFreshness(confirmedRequestStartedAt, 5_000 + CACHE_FRESHNESS_MS - 1).ok, true);
+	assert.deepEqual(cacheFreshness(confirmedRequestStartedAt, 5_000 + CACHE_FRESHNESS_MS), {
+		ok: false,
+		ageMs: CACHE_FRESHNESS_MS,
+		reason: "expired",
+	});
+});
+
+test("follow-up freshness uses the successful request start, not its completion", () => {
+	const successfulRequestStartedAt = 1_000;
+	const responseCompletedAt = 50_000;
+	const followUpAt = successfulRequestStartedAt + CACHE_FRESHNESS_MS;
+	assert.equal(cacheFreshness(successfulRequestStartedAt, followUpAt).ok, false);
+	assert.equal(cacheFreshness(responseCompletedAt, followUpAt).ok, true);
 });
 
 test("rough token estimate recognizes cache-eligible payloads", () => {

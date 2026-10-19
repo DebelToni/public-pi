@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discoverAgents } from "./agents.ts";
 import { registerNamedSubagentTools } from "./named-subagents.ts";
-import { runSingleAgent, sizedModel, type SingleResult } from "./index.ts";
+import { getPiInvocation, runSingleAgent, sizedModel, subagentEnvironment, type SingleResult } from "./index.ts";
+import { SubagentMonitorStore } from "./monitor.ts";
 
 type Tool = { execute: (...args: any[]) => Promise<any> };
 
@@ -16,19 +17,20 @@ function assistant(text: string): any {
 		content: [{ type: "text", text }],
 		api: "openai-codex-responses",
 		provider: "codex-pi7",
-		model: "gpt-5.6-luna",
+		model: "gpt-6-luna",
 		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
 }
 
-function harness(runSingleAgent: (...args: any[]) => Promise<SingleResult>) {
+function harness(runSingleAgent: (...args: any[]) => Promise<SingleResult>, monitor?: SubagentMonitorStore) {
 	const tools = new Map<string, Tool>();
 	const pi = {
 		registerTool(tool: Tool & { name: string }) { tools.set(tool.name, tool); },
+		appendEntry() {},
 	} as unknown as ExtensionAPI;
-	registerNamedSubagentTools(pi, { runSingleAgent: runSingleAgent as any, sizedModel });
+	registerNamedSubagentTools(pi, { runSingleAgent: runSingleAgent as any, sizedModel, monitor });
 	return tools;
 }
 
@@ -42,7 +44,7 @@ function context(project: string, sessionId: string, toolCallId: string) {
 			content: [{ type: "toolCall", id: toolCallId, name: "create_subagent", arguments: {} }],
 			api: "openai-codex-responses",
 			provider: "codex-pi7",
-			model: "gpt-5.6-sol",
+			model: "gpt-6.1-sol",
 			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			stopReason: "toolUse",
 			timestamp: 2,
@@ -62,12 +64,81 @@ function context(project: string, sessionId: string, toolCallId: string) {
 	};
 }
 
-test("size aliases always select Luna/Sol with high reasoning", () => {
-	assert.equal(sizedModel("small", "codex-pi7"), "codex-pi7/gpt-5.6-luna:high");
-	assert.equal(sizedModel("big", "codex-pi7"), "codex-pi7/gpt-5.6-sol:high");
-	assert.equal(sizedModel("small", "codex-pro"), "codex-pro/gpt-5.6-luna:high");
-	assert.equal(sizedModel("big", "codex-pro"), "codex-pro/gpt-5.6-sol:high");
-	assert.equal(sizedModel("small", "anthropic"), "openai-codex/gpt-5.6-luna:high");
+test("size aliases select Luna/high, Sol/low, and Sol/high", () => {
+	assert.equal(sizedModel("small", "codex-pi7"), "codex-pi7/gpt-6-luna:high");
+	assert.equal(sizedModel("big", "codex-pi7"), "codex-pi7/gpt-6.1-sol:low");
+	assert.equal(sizedModel("biggest", "codex-pi7"), "codex-pi7/gpt-6.1-sol:high");
+	assert.equal(sizedModel("small", "codex-pro"), "codex-pro/gpt-6-luna:high");
+	assert.equal(sizedModel("big", "codex-pro"), "codex-pro/gpt-6.1-sol:low");
+	assert.equal(sizedModel("biggest", "codex-pro"), "codex-pro/gpt-6.1-sol:high");
+	assert.equal(sizedModel("small", "anthropic"), "openai-codex/gpt-6-luna:high");
+	assert.equal(sizedModel("biggest", "anthropic"), "openai-codex/gpt-6.1-sol:high");
+});
+
+test("named subagents default to Sol/low but respect explicit template sizes", async (t) => {
+	const root = mkdtempSync(join(process.env.HOME!, "tmp/pi-named-default-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const agentDir = join(root, "agent");
+	mkdirSync(join(agentDir, "agents"), { recursive: true });
+	writeFileSync(join(agentDir, "agents", "general.md"), "---\nname: general\ndescription: General helper\n---\nGeneral instructions.\n");
+	writeFileSync(join(agentDir, "agents", "scout.md"), "---\nname: scout\ndescription: Bulk discovery\nsize: small\n---\nScout instructions.\n");
+	mkdirSync(join(root, ".agents", "subagents"), { recursive: true });
+	writeFileSync(join(root, ".agents", "subagents", "project-guide.md"), "---\nname: project-guide\ndescription: Project helper\nsize: small\n---\nProject instructions.\n");
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	t.after(() => {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+	});
+	const tools = harness(async () => { throw new Error("Creation must not launch a child"); });
+	const ctx = context(root, "default-parent", "create-default");
+	for (const [template, size] of [["general", "big"], ["scout", "small"]]) {
+		const result = await tools.get("create_subagent")!.execute(
+			`create-${template}`, { name: template, template }, undefined, undefined, ctx,
+		);
+		assert.equal(result.details.size, size);
+	}
+	for (const hasUI of [false, true]) {
+		const result = await tools.get("create_subagent")!.execute(
+			`create-project-${hasUI}`, { name: `project-${hasUI}`, template: "project-guide" }, undefined, undefined,
+			{ ...ctx, hasUI, ui: { confirm() { throw new Error("Trusted templates must not prompt"); } } },
+		);
+		assert.equal(result.details.template, "project-guide");
+		assert.equal(result.details.size, "small");
+	}
+	await assert.rejects(
+		tools.get("create_subagent")!.execute(
+			"untrusted-project", { name: "untrusted", template: "project-guide" }, undefined, undefined,
+			{ ...ctx, isProjectTrusted: () => false },
+		),
+		/Unknown template: project-guide/,
+	);
+});
+
+test("Ultra subagents re-enter the launcher instead of bypassing managed providers", (t) => {
+	const root = mkdtempSync("/tmp/pi-subagent-ultra-launcher-");
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const launcher = join(root, "launcher", "launcher.mjs");
+	mkdirSync(dirname(launcher), { recursive: true });
+	writeFileSync(launcher, "");
+	mkdirSync(join(root, "node_modules", "pi", "dist"), { recursive: true });
+	writeFileSync(join(root, "node_modules", "pi", "dist", "cli.js"), "");
+	assert.deepEqual(
+		getPiInvocation(["--model", "codex-pro/gpt-6.1-sol:high"], {
+			currentScript: join(root, "node_modules", "pi", "dist", "cli.js"),
+			execPath: "/opt/node",
+			ultraReleaseRoot: root,
+		}),
+		{
+			command: "/opt/node",
+			args: [realpathSync(launcher), "--model", "codex-pro/gpt-6.1-sol:high"],
+		},
+	);
+	assert.deepEqual(subagentEnvironment({
+		PI_SUBAGENT: "0",
+		PI_CODEX_ULTRA_UPDATE_CHECKED: "stale-release",
+		KEEP: "yes",
+	}), { PI_SUBAGENT: "1", KEEP: "yes", NODE_OPTIONS: "--max-old-space-size=8192" });
 });
 
 test("named subagent retains configuration across invokes and exports without conversation", async (t) => {
@@ -87,20 +158,26 @@ test("named subagent retains configuration across invokes and exports without co
 	});
 
 	const calls: any[][] = [];
+	const monitor = new SubagentMonitorStore();
 	const run = async (...args: any[]) => {
 		calls.push(args);
-		return {
-			agent: args[2], agentSource: "user", task: args[3], exitCode: 0,
-			messages: [assistant(`answer:${args[3]}`)], stderr: "", status: "completed", stopReason: "stop",
+		const monitored = args[12].monitor;
+		monitored?.store.markStarting(monitored.runId);
+		const interrupted = calls.length === 1;
+		const result = {
+			agent: args[2], agentSource: "user", task: args[3], exitCode: interrupted ? 130 : 0,
+			messages: [assistant(`answer:${args[3]}`)], stderr: "", status: interrupted ? "interrupted" : "completed", stopReason: interrupted ? "aborted" : "stop",
 			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 2, turns: 1 },
 		} as SingleResult;
+		if (monitored?.finalize !== false) monitored?.store.finishFromResult(monitored.runId, result);
+		return result;
 	};
-	const tools = harness(run);
+	const tools = harness(run, monitor);
 	const ctx = context(project, "parent-session", "create-call");
 
 	await tools.get("create_subagent")!.execute(
 		"create-call",
-		{ name: "api-expert", template: "general", size: "small", instructions: "Custom API instructions.", cwd: ".", history: "1", context: "cwd-only" },
+		{ name: "api-expert", template: "general", size: "biggest", instructions: "Custom API instructions.", cwd: ".", history: "1", context: "cwd-only" },
 		undefined,
 		undefined,
 		ctx,
@@ -108,14 +185,17 @@ test("named subagent retains configuration across invokes and exports without co
 	await tools.get("invoke_subagent")!.execute("invoke-1", { name: "api-expert", prompt: "first private prompt" }, undefined, undefined, ctx);
 	await tools.get("invoke_subagent")!.execute("invoke-2", { name: "api-expert", prompt: "second private prompt" }, undefined, undefined, ctx);
 
-	assert.equal(calls.length, 2);
+	assert.equal(calls.length, 3);
 	assert.equal(calls[0][3], "first private prompt");
-	assert.equal(calls[1][3], "second private prompt");
-	assert.equal(calls[0][6], "codex-pi7/gpt-5.6-luna:high");
+	assert.equal(calls[1][3], "first private prompt");
+	assert.equal(calls[1][12].monitor.finalize, false);
+	assert.equal(calls[2][3], "second private prompt");
+	assert.equal(calls[0][6], "codex-pi7/gpt-6.1-sol:high");
 	assert.equal(calls[0][4], project);
 	assert.equal(calls[0][5], "cwd-only");
-	assert.equal(calls[0][12].existingSession.filePath, calls[1][12].existingSession.filePath);
+	assert.equal(calls[0][12].existingSession.filePath, calls[2][12].existingSession.filePath);
 	assert.equal(calls[0][1][0].systemPrompt, "Custom API instructions.");
+	assert.deepEqual(monitor.getSummary("parent-session"), { total: 0, queued: 0, active: 0 });
 	const seededMessages = SessionManager.open(calls[0][12].existingSession.filePath).buildSessionContext().messages;
 	assert.equal((seededMessages[0] as any).content[0].text, "parent context");
 
@@ -128,16 +208,16 @@ test("named subagent retains configuration across invokes and exports without co
 	);
 	const exported = join(project, ".agents", "subagents", "api-expert.md");
 	const markdown = readFileSync(exported, "utf8");
-	assert.match(markdown, /size: small/);
+	assert.match(markdown, /size: biggest/);
 	assert.match(markdown, /capabilities: general/);
-	assert.match(markdown, /tools: read, grep, find, ls, bash, search_session/);
+	assert.match(markdown, /tools: read, grep, find, ls, bash, grep_current_session, grep_session_bank, read_session, ask_session, search_context/);
 	assert.match(markdown, /cwd: "\."/);
 	assert.match(markdown, /Custom API instructions/);
 	assert.doesNotMatch(markdown, /first private prompt|second private prompt|parent context/);
 
 	const discovered = discoverAgents(project, "both").agents.find((agent) => agent.name === "api-expert");
 	assert.equal(discovered?.source, "project");
-	assert.equal(discovered?.size, "small");
+	assert.equal(discovered?.size, "biggest");
 	assert.equal(discovered?.cwd, ".");
 	assert.equal(discovered?.cwdBase, project);
 	assert.equal(discovered?.history, "1");
@@ -216,7 +296,14 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: assistant })
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		process.argv[1] = previousScript;
 	});
-	const tools = harness(runSingleAgent as any);
+	const monitor = new SubagentMonitorStore();
+	const captured = new Map<string, Array<{ label?: string; text: string }>>();
+	monitor.subscribe(() => {
+		for (const run of monitor.getRuns("thread-parent")) {
+			if (!captured.has(run.id)) captured.set(run.id, run.transcript.filter((entry): entry is Exclude<(typeof run.transcript)[number], { type: "tool" }> => entry.type === "prompt").map((entry) => ({ label: entry.label, text: entry.text })));
+		}
+	});
+	const tools = harness(runSingleAgent as any, monitor);
 	const ctx = context(project, "thread-parent", "create-thread");
 	await tools.get("create_subagent")!.execute("create-thread", { name: "thread", template: "general", history: "none", context: "none" }, undefined, undefined, ctx);
 	const first = await tools.get("invoke_subagent")!.execute("invoke-a", { name: "thread", prompt: "first" }, undefined, undefined, ctx);
@@ -230,4 +317,17 @@ process.stdout.write(JSON.stringify({ type: "message_end", message: assistant })
 	assert.equal(second.content[0].text, "prior=2 Task: second");
 	assert.equal(repeated.content[0].text, "prior=4 Task: first");
 	assert.equal(fourth.content[0].text, "prior=8 Task: fourth");
+	const histories = [...captured.values()];
+	assert.equal(histories.length, 5);
+	assert.deepEqual(histories[0], [
+		{ label: "Creation instructions", text: "Thread instructions." },
+		{ label: "Initial task", text: "first" },
+	]);
+	assert.deepEqual(histories[1].map((entry) => entry.label), ["Creation instructions", "Initial task", "Follow-up task 1"]);
+	assert.deepEqual(histories[2].map((entry) => entry.label), ["Creation instructions", "Initial task", "Follow-up task 1", "Follow-up task 2"]);
+	assert.deepEqual(histories[4].map((entry) => entry.label), [
+		"Creation instructions", "Initial task", "Follow-up task 1", "Follow-up task 2", "Follow-up task 3", "Follow-up task 4",
+	]);
+	assert.deepEqual(histories[4].slice(1).map((entry) => entry.text), ["first", "second", "first", "first", "fourth"]);
+	assert.doesNotMatch(JSON.stringify(histories), /parent context/);
 });

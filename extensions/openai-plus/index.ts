@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { codexWireModelId } from "../lib/codex-long-context.js";
 import {
 	ONE_SHOT_MEDIUM_FAST_CHANNEL,
 	OneShotMediumFastState,
@@ -23,7 +24,7 @@ import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 const CONFIG_PATH = join(getAgentDir(), "openai-plus.json");
 const SERVICE_TIER = "priority";
 const IMAGE_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
-const DEFAULT_IMAGE_MODEL = "gpt-5.6-sol";
+const DEFAULT_IMAGE_MODEL = "gpt-6.1-sol";
 const DEFAULT_TIMEOUT_MS = 180_000;
 
 type Config = {
@@ -311,7 +312,7 @@ async function generateImage(params: ImageParams, ctx: ExtensionContext, request
 	const outputFormat = params.outputFormat ?? cfg.image.outputFormat;
 	const action = params.action ?? "auto";
 	const images = await readImageInputs(params.images, ctx.cwd || process.cwd());
-	const body = buildImageRequest(params, model, outputFormat, images);
+	const body = buildImageRequest(params, await codexWireModelId(model), outputFormat, images);
 	const timeoutSignal = AbortSignal.timeout(params.save === undefined ? cfg.image.timeoutMs : cfg.image.timeoutMs);
 	const baseSignal = requestSignal ?? ctx.signal;
 	const signal = baseSignal ? AbortSignal.any([baseSignal, timeoutSignal]) : timeoutSignal;
@@ -440,13 +441,14 @@ export default function openaiPlus(pi: ExtensionAPI) {
 			}
 			ctx.ui.notify("Requesting OpenAI image...", "info");
 			const result = await generateImage({ prompt }, ctx);
+			const { data, ...details } = result;
 			pi.sendMessage({
 				customType: "openai-image",
 				content: [
 					{ type: "text", text: resultText(result) },
-					{ type: "image", data: result.data, mimeType: result.mimeType },
+					{ type: "image", data, mimeType: result.mimeType },
 				],
-				details: result,
+				details,
 				display: true,
 			});
 		},
@@ -469,12 +471,13 @@ export default function openaiPlus(pi: ExtensionAPI) {
 		async execute(_id, params: ImageParams, signal, onUpdate, ctx) {
 			onUpdate?.({ content: [{ type: "text", text: "Requesting OpenAI image..." }], details: undefined });
 			const result = await generateImage(params, ctx, signal);
+			const { data, ...details } = result;
 			return {
 				content: [
 					{ type: "text", text: resultText(result) },
-					{ type: "image", data: result.data, mimeType: result.mimeType },
+					{ type: "image", data, mimeType: result.mimeType },
 				],
-				details: result,
+				details,
 			};
 		},
 	});

@@ -15,7 +15,7 @@ const model = {
 
 function payload(lastUserText: string, trailing: unknown[] = []) {
 	return {
-		model: "gpt-5.6-sol",
+		model: "gpt-6-sol",
 		reasoning: { effort: "max", summary: "auto" },
 		input: [
 			{ role: "user", content: [{ type: "input_text", text: lastUserText }] },
@@ -33,7 +33,7 @@ function activate(state: OneShotMediumFastState, text = "target prompt") {
 
 test("medium/fast payload preserves other fields", () => {
 	assert.deepEqual(applyMediumFast(payload("target")), {
-		model: "gpt-5.6-sol",
+		model: "gpt-6-sol",
 		reasoning: { effort: "medium", summary: "auto" },
 		service_tier: "priority",
 		input: [{ role: "user", content: [{ type: "input_text", text: "target" }] }],

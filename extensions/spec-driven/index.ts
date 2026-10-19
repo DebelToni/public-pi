@@ -707,11 +707,6 @@ export default function specDrivenExtension(pi: ExtensionAPI): void {
 				state.phase = "spec";
 				persist(pi);
 				updateStatus(ctx);
-				try {
-					pi.setThinkingLevel("xhigh");
-				} catch {
-					// Some providers may not expose xhigh. The prompt still enforces depth.
-				}
 				ctx.ui.notify(`Spec-driven import: ${displayPath(cwd, sourceAbs)} → ${scaffold.featureDirRel}`, "info");
 				pi.sendUserMessage(importPrompt(scaffold, sourceAbs, source.text, source.truncated, parsed.text));
 				return;
@@ -726,11 +721,6 @@ export default function specDrivenExtension(pi: ExtensionAPI): void {
 			state.phase = "spec";
 			persist(pi);
 			updateStatus(ctx);
-			try {
-				pi.setThinkingLevel("xhigh");
-			} catch {
-				// Some providers may not expose xhigh. The prompt still enforces depth.
-			}
 			ctx.ui.notify(`Spec-driven mode: ${scaffold.featureDirRel}`, "info");
 			pi.sendUserMessage(kickoffPrompt(scaffold, parsed.text, existingSessionContext));
 		},

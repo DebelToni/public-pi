@@ -1,0 +1,534 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+
+const CACHE_VERSION = 2;
+const DEFAULT_ROOT = path.join(os.homedir(), '.pi', 'agent', 'sessions');
+const CACHE_ROOT = process.platform === 'darwin'
+  ? path.join(os.homedir(), 'Library', 'Caches')
+  : process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+const DEFAULT_CACHE = path.join(CACHE_ROOT, 'pi-tokens', 'cache-v2.json');
+const BAR_WIDTH = 28;
+
+function usage() {
+  console.log(`Usage: pi-tokens [options] [sessions-root]
+
+Options:
+  --by-model          show all-time usage by model
+  --month YYYY-MM     show the GitHub-style calendar for this month (default: current)
+  --no-cache          rebuild without reading or writing the persistent cache
+  -h, --help          show this help`);
+}
+
+function parseArgs(argv) {
+  const options = { byModel: false, noCache: false, month: undefined, root: undefined };
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
+    if (arg === '--by-model') options.byModel = true;
+    else if (arg === '--no-cache') options.noCache = true;
+    else if (arg === '-h' || arg === '--help') options.help = true;
+    else if (arg === '--month') {
+      const value = argv[++index];
+      if (!value) throw new Error('--month requires YYYY-MM');
+      options.month = value;
+    } else if (arg.startsWith('--month=')) options.month = arg.slice('--month='.length);
+    else if (arg.startsWith('-')) throw new Error(`Unknown option: ${arg}`);
+    else if (options.root) throw new Error('Only one sessions root may be supplied');
+    else options.root = arg;
+  }
+  options.root ||= DEFAULT_ROOT;
+  options.month ||= localMonthKey(new Date());
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(options.month)) {
+    throw new Error('--month must use YYYY-MM');
+  }
+  return options;
+}
+
+function walk(dir, out = []) {
+  if (!fs.existsSync(dir)) return out;
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    const item = path.join(dir, ent.name);
+    if (ent.isDirectory()) walk(item, out);
+    else if (ent.isFile() && ent.name.endsWith('.jsonl')) out.push(item);
+  }
+  return out;
+}
+
+function empty() {
+  return {
+    input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0,
+    cost: 0, messages: 0, user: 0, assistant: 0, internal: 0, sessions: 0,
+  };
+}
+
+function addUsage(acc, usage = {}) {
+  acc.input += usage.input || 0;
+  acc.output += usage.output || 0;
+  acc.reasoning += usage.reasoning || usage.reasoningTokens || 0;
+  acc.cacheRead += usage.cacheRead || 0;
+  acc.cacheWrite += usage.cacheWrite || 0;
+  acc.cost += usage.cost?.total || 0;
+}
+
+function addSummary(target, source) {
+  for (const key of Object.keys(empty())) target[key] += source[key] || 0;
+}
+
+function addNamedSummary(target, name, source) {
+  target[name] ||= empty();
+  addSummary(target[name], source);
+}
+
+function localDateKey(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return undefined;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function localMonthKey(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function entryDay(entry) {
+  return localDateKey(entry.timestamp ?? entry.message?.timestamp ?? entry.data?.timestamp);
+}
+
+function processLine(line, aggregate) {
+  let entry;
+  try { entry = JSON.parse(line); } catch { return; }
+
+  if (entry.type === 'message') {
+    aggregate.total.messages++;
+    const message = entry.message || {};
+    if (message.role === 'user') aggregate.total.user++;
+    if (message.role !== 'assistant') return;
+    aggregate.total.assistant++;
+    addUsage(aggregate.total, message.usage);
+    const model = `${message.provider || 'unknown'}/${message.model || 'unknown'}`;
+    addNamedSummary(aggregate.models, model, { ...empty(), assistant: 1 });
+    addUsage(aggregate.models[model], message.usage);
+    const day = entryDay(entry);
+    if (day) {
+      addNamedSummary(aggregate.days, day, { ...empty(), assistant: 1 });
+      addUsage(aggregate.days[day], message.usage);
+    }
+    return;
+  }
+
+  if (entry.type !== 'custom' || entry.customType !== 'pi-internal-llm-usage') return;
+  const data = entry.data || {};
+  aggregate.total.internal++;
+  addUsage(aggregate.total, data.usage);
+  const model = `${data.provider || 'unknown'}/${data.model || 'unknown'}`;
+  addNamedSummary(aggregate.models, model, { ...empty(), internal: 1 });
+  addUsage(aggregate.models[model], data.usage);
+  const day = entryDay(entry);
+  if (day) {
+    addNamedSummary(aggregate.days, day, { ...empty(), internal: 1 });
+    addUsage(aggregate.days[day], data.usage);
+  }
+}
+
+function emptyAggregate() {
+  return { total: empty(), days: {}, models: {} };
+}
+
+function mergeAggregate(target, source) {
+  addSummary(target.total, source.total || {});
+  for (const [day, summary] of Object.entries(source.days || {})) {
+    addNamedSummary(target.days, day, summary);
+  }
+  for (const [model, summary] of Object.entries(source.models || {})) {
+    addNamedSummary(target.models, model, summary);
+  }
+}
+
+function scanFile(file, start, end, aggregate, onBytes) {
+  if (start >= end) {
+    const digest = crypto.createHash('sha256').digest('hex');
+    return Promise.resolve({
+      offset: end,
+      prefixHash: start === 0 ? digest : undefined,
+      segmentHash: digest,
+    });
+  }
+  return new Promise((resolve, reject) => {
+    let parts = [];
+    let partBytes = 0;
+    const segmentHash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(file, {
+      start,
+      end: end - 1,
+      highWaterMark: 1024 * 1024,
+    });
+    stream.on('data', (chunk) => {
+      segmentHash.update(chunk);
+      onBytes(chunk.length);
+      let cursor = 0;
+      while (cursor < chunk.length) {
+        const newline = chunk.indexOf(0x0a, cursor);
+        if (newline === -1) {
+          const tail = chunk.subarray(cursor);
+          parts.push(tail);
+          partBytes += tail.length;
+          break;
+        }
+        const segment = chunk.subarray(cursor, newline);
+        let line;
+        if (parts.length) {
+          parts.push(segment);
+          line = Buffer.concat(parts, partBytes + segment.length);
+        } else {
+          line = segment;
+        }
+        if (line.length && line[line.length - 1] === 0x0d) line = line.subarray(0, -1);
+        processLine(line.toString('utf8'), aggregate);
+        parts = [];
+        partBytes = 0;
+        cursor = newline + 1;
+      }
+    });
+    stream.on('error', reject);
+    stream.on('end', () => {
+      if (!partBytes) {
+        const digest = segmentHash.digest('hex');
+        resolve({
+          offset: end,
+          prefixHash: start === 0 ? digest : undefined,
+          segmentHash: digest,
+        });
+        return;
+      }
+      const finalBuffer = Buffer.concat(parts, partBytes);
+      const finalLine = finalBuffer.length && finalBuffer[finalBuffer.length - 1] === 0x0d
+        ? finalBuffer.subarray(0, -1)
+        : finalBuffer;
+      try {
+        JSON.parse(finalLine.toString('utf8'));
+      } catch {
+        resolve({ offset: end - partBytes });
+        return;
+      }
+      processLine(finalLine.toString('utf8'), aggregate);
+      const digest = segmentHash.digest('hex');
+      resolve({
+        offset: end,
+        prefixHash: start === 0 ? digest : undefined,
+        segmentHash: digest,
+      });
+    });
+  });
+}
+
+function hashRange(file, start, end) {
+  if (start >= end) return Promise.resolve(crypto.createHash('sha256').digest('hex'));
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(file, { start, end: end - 1 });
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+function hashPrefix(file, length) {
+  return hashRange(file, 0, length);
+}
+
+function cachePathForRoot(root) {
+  if (path.resolve(root) === path.resolve(DEFAULT_ROOT)) return DEFAULT_CACHE;
+  const digest = crypto.createHash('sha256').update(path.resolve(root)).digest('hex').slice(0, 16);
+  return path.join(path.dirname(DEFAULT_CACHE), `cache-v2-${digest}.json`);
+}
+
+function loadCache(cachePath, timezone) {
+  try {
+    const value = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    if (value.version !== CACHE_VERSION || value.timezone !== timezone || typeof value.files !== 'object') return undefined;
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveCache(cachePath, value) {
+  const dir = path.dirname(cachePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  const temporary = `${cachePath}.${process.pid}.tmp`;
+  const descriptor = fs.openSync(temporary, 'w', 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(value)}\n`);
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  fs.renameSync(temporary, cachePath);
+  fs.chmodSync(cachePath, 0o600);
+  const directory = fs.openSync(dir, 'r');
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+}
+
+function progressReporter(totalBytes, fileCount) {
+  const interactive = Boolean(process.stderr.isTTY);
+  let completed = 0;
+  let lastLength = 0;
+  let lastUpdate = 0;
+  function render(force = false) {
+    if (!interactive) return;
+    const now = Date.now();
+    if (!force && now - lastUpdate < 100) return;
+    lastUpdate = now;
+    const ratio = totalBytes ? Math.min(1, completed / totalBytes) : 1;
+    const filled = Math.round(ratio * BAR_WIDTH);
+    const text = `  Scanning ${fileCount} changed session files  [${'█'.repeat(filled)}${'░'.repeat(BAR_WIDTH - filled)}] ${String(Math.floor(ratio * 100)).padStart(3)}%`;
+    process.stderr.write(`\r${text}${' '.repeat(Math.max(0, lastLength - text.length))}`);
+    lastLength = text.length;
+  }
+  if (fileCount) render(true);
+  return {
+    add(bytes) { completed += bytes; render(); },
+    done() {
+      if (!interactive || !fileCount) return;
+      completed = totalBytes;
+      render(true);
+      process.stderr.write('\n');
+    },
+  };
+}
+
+async function collect(root, { noCache = false, cachePath = DEFAULT_CACHE } = {}) {
+  const files = walk(root).sort();
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+  const cache = noCache ? undefined : loadCache(cachePath, timezone);
+  const nextCache = { version: CACHE_VERSION, timezone, files: {} };
+  const work = [];
+  let announcedVerification = false;
+
+  for (const file of files) {
+    const stat = fs.statSync(file);
+    const prior = cache?.files?.[file];
+    const identityMatches = prior && prior.dev === stat.dev && prior.ino === stat.ino;
+    const priorOffset = prior?.offset ?? prior?.size;
+    const metadataMatches = prior?.size === stat.size && prior?.mtimeMs === stat.mtimeMs;
+    if (identityMatches && metadataMatches && priorOffset === stat.size) {
+      nextCache.files[file] = prior;
+      continue;
+    }
+    const mayBeAppend = identityMatches
+      && prior.aggregate
+      && prior.prefixHash
+      && ((metadataMatches && priorOffset < stat.size) || prior.size < stat.size);
+    if (mayBeAppend && process.stderr.isTTY && !announcedVerification) {
+      console.error('  Verifying the changed session prefix before incremental indexing…');
+      announcedVerification = true;
+    }
+    if (mayBeAppend && await hashPrefix(file, priorOffset) === prior.prefixHash) {
+      work.push({ file, stat, start: priorOffset, aggregate: prior.aggregate });
+    } else {
+      work.push({ file, stat, start: 0, aggregate: emptyAggregate() });
+    }
+  }
+
+  const bytes = work.reduce((sum, item) => sum + item.stat.size - item.start, 0);
+  if (process.stderr.isTTY) {
+    if (work.length) {
+      const size = formatBytes(bytes);
+      console.error(`  Indexing ${size} from ${work.length} of ${files.length} sessions; cached runs are incremental.`);
+    } else {
+      console.error(`  Loaded ${files.length} indexed sessions.`);
+    }
+  }
+  const progress = progressReporter(bytes, work.length);
+  for (const item of work) {
+    const scanned = await scanFile(
+      item.file,
+      item.start,
+      item.stat.size,
+      item.aggregate,
+      (count) => progress.add(count),
+    );
+    if (
+      scanned.offset === item.stat.size
+      && await hashRange(item.file, item.start, scanned.offset) !== scanned.segmentHash
+    ) {
+      throw new Error(`Session changed non-append while it was being indexed: ${item.file}`);
+    }
+    nextCache.files[item.file] = {
+      dev: item.stat.dev,
+      ino: item.stat.ino,
+      size: item.stat.size,
+      offset: scanned.offset,
+      prefixHash: scanned.prefixHash || await hashPrefix(item.file, scanned.offset),
+      mtimeMs: item.stat.mtimeMs,
+      aggregate: item.aggregate,
+    };
+  }
+  progress.done();
+  if (!noCache) saveCache(cachePath, nextCache);
+
+  const aggregate = emptyAggregate();
+  aggregate.total.sessions = files.length;
+  for (const item of Object.values(nextCache.files)) mergeAggregate(aggregate, item.aggregate);
+  aggregate.total.sessions = files.length;
+  return aggregate;
+}
+
+function fmt(n) {
+  if (!Number.isFinite(n)) return '0';
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(n / 1e3).toFixed(2)}K`;
+  return String(Math.round(n));
+}
+
+function formatBytes(n) {
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(1)} GiB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MiB`;
+  return `${Math.round(n / 1024)} KiB`;
+}
+
+function money(n) { return `$${n.toFixed(2)}`; }
+function pad(label, value) { console.log(`${label.padEnd(22)}${String(value).padStart(14)}`); }
+
+function monthDetails(month) {
+  const [year, number] = month.split('-').map(Number);
+  const first = new Date(0);
+  first.setFullYear(year, number - 1, 1);
+  first.setHours(0, 0, 0, 0);
+  const last = new Date(0);
+  last.setFullYear(year, number, 0);
+  last.setHours(0, 0, 0, 0);
+  const days = last.getDate();
+  const mondayOffset = (first.getDay() + 6) % 7;
+  return { year, number, first, days, mondayOffset, weeks: Math.ceil((mondayOffset + days) / 7) };
+}
+
+function heatLevels(values) {
+  const nonzero = values.filter((value) => value > 0).sort((a, b) => a - b);
+  if (!nonzero.length) return values.map(() => 0);
+  const quantile = (fraction) => nonzero[Math.min(nonzero.length - 1, Math.floor((nonzero.length - 1) * fraction))];
+  const thresholds = [quantile(0.25), quantile(0.5), quantile(0.75)];
+  return values.map((value) => {
+    if (!value) return 0;
+    if (value <= thresholds[0]) return 1;
+    if (value <= thresholds[1]) return 2;
+    if (value <= thresholds[2]) return 3;
+    return 4;
+  });
+}
+
+function heatCell(level, color) {
+  if (!color) return ['·', '░', '▒', '▓', '█'][level];
+  const colors = [238, 22, 28, 34, 40];
+  return `\x1b[38;5;${colors[level]}m■\x1b[0m`;
+}
+
+function renderMonth(days, month, { color = Boolean(process.stdout.isTTY && !process.env.NO_COLOR) } = {}) {
+  const details = monthDetails(month);
+  const summaries = Array.from({ length: details.days }, (_, index) => days[`${month}-${String(index + 1).padStart(2, '0')}`] || empty());
+  const values = summaries.map((summary) => summary.input + summary.output);
+  const levels = heatLevels(values);
+  const monthTotal = empty();
+  for (const summary of summaries) addSummary(monthTotal, summary);
+  const activeDays = values.filter(Boolean).length;
+  const title = details.first.toLocaleString(undefined, { month: 'long', year: 'numeric' });
+
+  console.log(`  ${title} · ${fmt(monthTotal.input + monthTotal.output)} recorded tokens · ${activeDays} active days`);
+  console.log('  ' + '─'.repeat(50));
+  const weekDates = Array.from({ length: details.weeks }, (_, week) => (
+    Math.max(1, 1 + week * 7 - details.mondayOffset)
+  ));
+  console.log(`     ${weekDates.map((day) => String(day).padStart(2)).join(' ')}`);
+  const labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  for (let weekday = 0; weekday < 7; weekday++) {
+    const cells = [];
+    for (let week = 0; week < details.weeks; week++) {
+      const day = 1 + week * 7 + weekday - details.mondayOffset;
+      cells.push(day >= 1 && day <= details.days ? heatCell(levels[day - 1], color) : ' ');
+    }
+    console.log(`${labels[weekday]}  ${cells.join('  ')}`);
+  }
+  console.log(`     Less ${[0, 1, 2, 3, 4].map((level) => heatCell(level, color)).join(' ')} More`);
+  pad('Month Input:', fmt(monthTotal.input));
+  pad('Month Output:', fmt(monthTotal.output));
+  if (monthTotal.cost > 0) pad('Month Cost:', money(monthTotal.cost));
+  console.log('');
+}
+
+function renderReport(aggregate, options) {
+  const total = aggregate.total;
+  console.log('');
+  console.log('  Pi All-Time Usage');
+  console.log('  ' + '─'.repeat(50));
+  pad('Total Tokens:', fmt(total.input + total.output));
+  pad('  Input:', fmt(total.input));
+  pad('  Output:', fmt(total.output));
+  if (total.reasoning > 0) pad('  Reasoning:', fmt(total.reasoning));
+  pad('Cache Read:', fmt(total.cacheRead));
+  if (total.cacheWrite > 0) pad('Cache Write:', fmt(total.cacheWrite));
+  pad('Total Cost:', money(total.cost));
+  pad('Messages:', total.messages);
+  pad('User Messages:', total.user);
+  pad('Assistant:', total.assistant);
+  pad('Sessions:', total.sessions);
+  console.log('');
+
+  renderMonth(aggregate.days, options.month);
+
+  if (options.byModel) {
+    console.log('  By Model');
+    console.log('  ' + '─'.repeat(50));
+    for (const [model, summary] of Object.entries(aggregate.models).sort((a, b) => b[1].cost - a[1].cost)) {
+      console.log(model);
+      console.log(`  tokens=${fmt(summary.input + summary.output)} cache=${fmt(summary.cacheRead)} cost=${money(summary.cost)} assistant=${summary.assistant}`);
+    }
+    console.log('');
+  }
+}
+
+async function main(argv = process.argv.slice(2)) {
+  let options;
+  try { options = parseArgs(argv); }
+  catch (error) {
+    console.error(`pi-tokens: ${error.message}`);
+    console.error('Run pi-tokens --help for usage.');
+    return 2;
+  }
+  if (options.help) {
+    usage();
+    return 0;
+  }
+  const aggregate = await collect(options.root, {
+    noCache: options.noCache,
+    cachePath: cachePathForRoot(options.root),
+  });
+  renderReport(aggregate, options);
+  return 0;
+}
+
+if (require.main === module) {
+  main().then((status) => { process.exitCode = status; }).catch((error) => {
+    console.error(`pi-tokens: ${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  addUsage,
+  cachePathForRoot,
+  collect,
+  empty,
+  heatLevels,
+  localDateKey,
+  monthDetails,
+  parseArgs,
+  processLine,
+  renderMonth,
+};

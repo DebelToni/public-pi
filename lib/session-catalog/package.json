@@ -1,0 +1,13 @@
+{
+  "name": "@anton/session-store",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Normalized, rebuildable SQLite storage for authoritative Pi JSONL sessions",
+  "scripts": {
+    "test": "node --test ../../bin/test_pi_session_catalog.mjs"
+  },
+  "dependencies": {
+    "stream-json": "3.6.0"
+  }
+}

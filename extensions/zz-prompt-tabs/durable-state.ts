@@ -17,7 +17,14 @@ import { basename, dirname, join, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { DraftTabsSnapshot } from "./tabbed-editor.ts";
 
-export const DURABLE_PROMPT_TABS_VERSION = 1;
+export const DURABLE_PROMPT_TABS_VERSION = 2;
+
+export type ClosedPromptTab = {
+	text: string;
+	closedAt: number;
+	index: number;
+	wasOnlyTab: boolean;
+};
 
 export type DurablePromptTabsState = {
 	version: typeof DURABLE_PROMPT_TABS_VERSION;
@@ -27,10 +34,12 @@ export type DurablePromptTabsState = {
 	updatedAt: number;
 	selectedIndex: number;
 	tabs: Array<{ text: string }>;
+	closedTabs: ClosedPromptTab[];
 };
 
 export type DurablePromptTabsLoadResult = {
 	snapshot?: DraftTabsSnapshot;
+	closedTabs: ClosedPromptTab[];
 	diagnostics: string[];
 };
 
@@ -52,9 +61,25 @@ function validRecordId(value: unknown): value is string {
 		&& /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
-function validState(value: unknown, sessionId: string, fileName: string): value is DurablePromptTabsState {
+function validClosedTab(value: unknown): value is ClosedPromptTab {
+	return isRecord(value)
+		&& typeof value.text === "string"
+		&& value.text.trim() !== ""
+		&& typeof value.closedAt === "number"
+		&& Number.isFinite(value.closedAt)
+		&& typeof value.index === "number"
+		&& Number.isInteger(value.index)
+		&& value.index >= 0
+		&& typeof value.wasOnlyTab === "boolean";
+}
+
+function normalizeState(
+	value: unknown,
+	sessionId: string,
+	fileName: string,
+): DurablePromptTabsState | undefined {
 	if (!isRecord(value)
-		|| value.version !== DURABLE_PROMPT_TABS_VERSION
+		|| (value.version !== 1 && value.version !== DURABLE_PROMPT_TABS_VERSION)
 		|| !validRecordId(value.recordId)
 		|| fileName !== `${value.recordId}.json`
 		|| value.sessionId !== sessionId
@@ -65,10 +90,23 @@ function validState(value: unknown, sessionId: string, fileName: string): value 
 		|| !Number.isInteger(value.selectedIndex)
 		|| !Array.isArray(value.tabs)
 		|| value.tabs.length === 0
-		|| !value.tabs.every((tab) => isRecord(tab) && typeof tab.text === "string")) {
-		return false;
+		|| !value.tabs.every((tab) => isRecord(tab) && typeof tab.text === "string")
+		|| value.selectedIndex < 0
+		|| value.selectedIndex >= value.tabs.length) {
+		return undefined;
 	}
-	return value.selectedIndex >= 0 && value.selectedIndex < value.tabs.length;
+	const closedTabs = value.version === 1 ? [] : value.closedTabs;
+	if (!Array.isArray(closedTabs) || !closedTabs.every(validClosedTab)) return undefined;
+	return {
+		version: DURABLE_PROMPT_TABS_VERSION,
+		recordId: value.recordId,
+		sessionId: value.sessionId,
+		sessionFile: value.sessionFile,
+		updatedAt: value.updatedAt,
+		selectedIndex: value.selectedIndex,
+		tabs: value.tabs as Array<{ text: string }>,
+		closedTabs,
+	};
 }
 
 function validSnapshot(snapshot: DraftTabsSnapshot) {
@@ -184,7 +222,7 @@ export class DurablePromptTabsStore {
 	}
 
 	load(): DurablePromptTabsLoadResult {
-		if (!existsSync(this.directory)) return { diagnostics: [] };
+		if (!existsSync(this.directory)) return { closedTabs: [], diagnostics: [] };
 		const diagnostics: string[] = [];
 		const candidates: Candidate[] = [];
 		let malformed = 0;
@@ -198,13 +236,14 @@ export class DurablePromptTabsStore {
 				malformed++;
 				continue;
 			}
-			if (!validState(parsed, this.sessionId, name)) {
+			const state = normalizeState(parsed, this.sessionId, name);
+			if (!state) {
 				malformed++;
 				continue;
 			}
 			candidates.push({
-				state: parsed,
-				match: classifySessionFile(parsed.sessionFile, this.sessionFile),
+				state,
+				match: classifySessionFile(state.sessionFile, this.sessionFile),
 			});
 		}
 		if (malformed > 0) {
@@ -223,7 +262,7 @@ export class DurablePromptTabsStore {
 				diagnostics.push("Prompt-tab state was not restored because multiple vanished source paths matched this moved session.");
 			}
 		}
-		if (!selected) return { diagnostics };
+		if (!selected) return { closedTabs: [], diagnostics };
 
 		this.recordId = selected.state.recordId;
 		return {
@@ -231,6 +270,7 @@ export class DurablePromptTabsStore {
 				texts: selected.state.tabs.map((tab) => tab.text),
 				activeIndex: selected.state.selectedIndex,
 			},
+			closedTabs: selected.state.closedTabs,
 			diagnostics,
 		};
 	}
@@ -245,8 +285,9 @@ export class DurablePromptTabsStore {
 		}
 	}
 
-	save(snapshot: DraftTabsSnapshot) {
+	save(snapshot: DraftTabsSnapshot, closedTabs: ClosedPromptTab[] = []) {
 		if (!validSnapshot(snapshot)) throw new Error("Refusing to persist an invalid prompt-tab snapshot.");
+		if (!closedTabs.every(validClosedTab)) throw new Error("Refusing to persist invalid closed prompt tabs.");
 		const rootCreated = ensurePrivateDirectory(this.root);
 		if (rootCreated) fsyncDirectory(dirname(this.root));
 		const directoryCreated = ensurePrivateDirectory(this.directory);
@@ -260,6 +301,7 @@ export class DurablePromptTabsStore {
 			updatedAt: Date.now(),
 			selectedIndex: snapshot.activeIndex,
 			tabs: snapshot.texts.map((text) => ({ text })),
+			closedTabs,
 		};
 		atomicWritePromptTabsState(join(this.directory, `${this.recordId}.json`), state);
 	}

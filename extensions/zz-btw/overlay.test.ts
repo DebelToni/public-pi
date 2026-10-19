@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
-import btwExtension, { BtwOverlay, CACHE_VISIBILITY_DELAY_MS, cacheVisibilityReadyAt, streamEventForLog } from "./index.ts";
+import btwExtension, {
+	BtwOverlay,
+	parentCompletionProblem,
+	sideThreadModeForStopReason,
+	streamEventForLog,
+	waitForCompletedParent,
+} from "./index.ts";
 
 test("/status passes the exact status question to /btw", async () => {
 	type Command = {
@@ -26,9 +32,44 @@ test("/status passes the exact status question to /btw", async () => {
 	assert.deepEqual(received, { args: "status and eta?", ctx: context });
 });
 
-test("parallel cache forks wait for backend visibility without waiting for parent completion", () => {
-	assert.equal(CACHE_VISIBILITY_DELAY_MS, 2_000);
-	assert.equal(cacheVisibilityReadyAt(12_345), 14_345);
+test("wait-for-ready ignores early stream deltas until parent completion", async () => {
+	const capsule: { completedAt?: number; stopReason?: string } = { stopReason: "pending" };
+	let delayCalls = 0;
+	const result = await waitForCompletedParent(capsule, () => capsule, new AbortController().signal, {
+		now: () => 100,
+		delay: async () => {
+			delayCalls++;
+			capsule.completedAt = 101;
+			capsule.stopReason = "stop";
+			return true;
+		},
+	});
+	assert.equal(delayCalls, 1);
+	assert.equal(result, capsule);
+});
+
+test("failed parent completion is returned promptly instead of hanging", async () => {
+	const capsule = { completedAt: 101, stopReason: "error" };
+	const result = await waitForCompletedParent(capsule, () => capsule, new AbortController().signal, {
+		now: () => 101,
+		delay: async () => { throw new Error("completion should not poll"); },
+	});
+	assert.equal(result?.stopReason, "error");
+});
+
+test("completed parent tool use is accepted only for a prefix-only fork", () => {
+	assert.equal(sideThreadModeForStopReason("toolUse"), "parallel-prefix-fork");
+	assert.equal(parentCompletionProblem("parallel-prefix-fork", { stopReason: "toolUse" }), undefined);
+	assert.match(
+		parentCompletionProblem("completed-continuation", { stopReason: "toolUse", responseId: "response" }) ?? "",
+		/no clean stop/,
+	);
+});
+
+test("completed continuation requires a clean stop and response id", () => {
+	assert.equal(sideThreadModeForStopReason("stop"), "completed-continuation");
+	assert.equal(parentCompletionProblem("completed-continuation", { stopReason: "stop", responseId: "response" }), undefined);
+	assert.match(parentCompletionProblem("completed-continuation", { stopReason: "stop" }) ?? "", /continuation id/);
 });
 
 const usage = {
@@ -96,6 +137,32 @@ test("completed overlay renders a focused follow-up input within its width", () 
 	assert.ok(lines.every((line) => visibleWidth(line) <= 60));
 	assert.match(lines.join("\n"), /Enter sends follow-up/);
 	assert.match(lines.join("\n"), /Ctrl\+X copies all/);
+});
+
+test("cache miss stays visible as a warning while follow-ups remain enabled", () => {
+	const harness = overlayHarness();
+	harness.overlay.focused = true;
+	harness.overlay.enableFollowUps();
+	harness.overlay.setDone({ ...usage, cacheRead: 0 }, "The provider reported a parent cache miss.");
+	for (const char of "follow up") harness.overlay.handleInput(char);
+	harness.overlay.handleInput("\r");
+	assert.deepEqual(harness.followUps, ["follow up"]);
+	const rendered = harness.overlay.render(100).join("\n");
+	assert.match(rendered, /cache MISS/);
+	assert.doesNotMatch(rendered, /Side thread stopped/);
+});
+
+test("poor cache coverage stays visible as a warning while follow-ups remain enabled", () => {
+	const harness = overlayHarness();
+	harness.overlay.focused = true;
+	harness.overlay.enableFollowUps();
+	harness.overlay.setDone({ ...usage, cacheRead: 899 }, "poor parent cache coverage: 89.90%");
+	harness.overlay.handleInput("follow up");
+	harness.overlay.handleInput("\r");
+	assert.deepEqual(harness.followUps, ["follow up"]);
+	const rendered = harness.overlay.render(120).join("\n");
+	assert.match(rendered, /poor parent cache coverage: 89\.90%/);
+	assert.doesNotMatch(rendered, /Side thread stopped/);
 });
 
 test("ctrl+x copies the whole multi-turn side conversation without closing it", async () => {

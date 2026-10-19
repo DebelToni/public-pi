@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+
+TARGET = Path(os.environ.get(
+    "PI_INTERACTIVE_MODE_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js",
+))
+text = TARGET.read_text("utf8")
+changed = False
+
+
+def replace_once(label: str, old: str, new: str, marker: str):
+    global text, changed
+    if marker in text:
+        print(f"skip {label}: already patched")
+        return
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected one match in {TARGET}, found {count}")
+    text = text.replace(old, new)
+    changed = True
+    print(f"patched {label}")
+
+
+replace_once(
+    "compaction working message bridge",
+    '''            setWorkingMessage: (message) => {
+                this.workingMessage = message;
+                if (this.activeStatusIndicator?.kind === "working") {
+                    this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
+                }
+            },
+''',
+    '''            setWorkingMessage: (message) => {
+                this.workingMessage = message;
+                if (this.activeStatusIndicator?.kind === "working") {
+                    this.activeStatusIndicator.setMessage(message ?? this.defaultWorkingMessage);
+                }
+                else if (this.activeStatusIndicator?.kind === "compaction" && message !== undefined) {
+                    this.activeStatusIndicator.setMessage(message);
+                }
+            },
+''',
+    '''else if (this.activeStatusIndicator?.kind === "compaction" && message !== undefined)''',
+)
+
+replace_once(
+    "compaction working indicator bridge",
+    '''        if (this.activeStatusIndicator?.kind === "working") {
+            this.activeStatusIndicator.setIndicator(options);
+        }
+''',
+    '''        if (this.activeStatusIndicator?.kind === "working" || this.activeStatusIndicator?.kind === "compaction") {
+            this.activeStatusIndicator.setIndicator(options);
+        }
+''',
+    '''this.activeStatusIndicator?.kind === "working" || this.activeStatusIndicator?.kind === "compaction"''',
+)
+
+if changed:
+    TARGET.write_text(text, "utf8")
+    print(f"wrote {TARGET}")
+else:
+    print("compaction loader progress patch already present")

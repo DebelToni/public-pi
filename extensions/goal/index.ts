@@ -6,38 +6,56 @@ import { recordInternalUsage } from "../lib/internal-usage.js";
 
 const STATE_TYPE = "pi-goal-state";
 const GOAL_PROVIDER = "openai-codex";
-const GOAL_MODEL = "gpt-5.6-sol";
+const GOAL_MODEL = "gpt-6.1-sol";
 const GOAL_REASONING = "high";
 
 type GoalState = {
 	active: boolean;
 	goal: string;
 	lastAssistantEntryId?: string;
+	runTimestamps: number[];
 };
 
-const state: GoalState = { active: false, goal: "" };
+const state: GoalState = { active: false, goal: "", runTimestamps: [] };
 let evaluating = false;
 
 function persist(pi: ExtensionAPI) {
-	pi.appendEntry(STATE_TYPE, { ...state });
+	pi.appendEntry(STATE_TYPE, { ...state, runTimestamps: [...state.runTimestamps] });
 }
 
 function restore(ctx: ExtensionContext) {
+	state.active = false;
+	state.goal = "";
+	state.lastAssistantEntryId = undefined;
+	state.runTimestamps = [];
 	for (const e of ctx.sessionManager.getBranch()) {
 		if (e.type !== "custom" || e.customType !== STATE_TYPE) continue;
 		const data = e.data as any;
 		state.active = !!data?.active;
 		state.goal = typeof data?.goal === "string" ? data.goal : "";
 		state.lastAssistantEntryId = typeof data?.lastAssistantEntryId === "string" ? data.lastAssistantEntryId : undefined;
+		state.runTimestamps = Array.isArray(data?.runTimestamps)
+			? data.runTimestamps.filter((timestamp: unknown): timestamp is number => typeof timestamp === "number" && Number.isFinite(timestamp))
+			: [];
 	}
 }
 
-function latestAssistantSegment(ctx: ExtensionContext) {
+export function formatGoalStatus(goal: string, runTimestamps: number[]) {
+	const lines = [`Goal armed: ${goal}`, `Runs: ${runTimestamps.length}`];
+	for (const [index, timestamp] of runTimestamps.entries()) {
+		lines.push(`${index + 1}. ${new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" }).format(timestamp)}`);
+	}
+	return lines.join("\n");
+}
+
+export function latestAssistantSegment(ctx: ExtensionContext) {
 	const branch = ctx.sessionManager.getBranch();
 	let assistantIndex = -1;
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const e = branch[i];
-		if (e.type === "message" && e.message.role === "assistant") {
+		if (e.type !== "message") continue;
+		if (e.message.role === "user") return undefined;
+		if (e.message.role === "assistant") {
 			assistantIndex = i;
 			break;
 		}
@@ -78,6 +96,7 @@ function stopGoal(pi: ExtensionAPI) {
 	state.active = false;
 	state.goal = "";
 	state.lastAssistantEntryId = undefined;
+	state.runTimestamps = [];
 	persist(pi);
 }
 
@@ -103,7 +122,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const goal = args.trim();
 			if (!goal || goal === "status") {
-				ctx.ui.notify(state.active ? `Goal active: ${state.goal}` : "No active goal", "info");
+				ctx.ui.notify(state.active ? formatGoalStatus(state.goal, state.runTimestamps) : "No active goal", "info");
 				return;
 			}
 			if (["off", "stop", "clear", "done"].includes(goal.toLowerCase())) {
@@ -114,6 +133,7 @@ export default function (pi: ExtensionAPI) {
 			state.active = true;
 			state.goal = goal;
 			state.lastAssistantEntryId = undefined;
+			state.runTimestamps = [Date.now()];
 			persist(pi);
 			ctx.ui.notify(`Goal armed: ${goal}`, "info");
 			const kickoff = `Work toward this goal until it is fully complete:\n\n${goal}`;
@@ -141,12 +161,13 @@ export default function (pi: ExtensionAPI) {
 			const decision = await evaluateGoal(pi, ctx);
 			if (!decision) return;
 			state.lastAssistantEntryId = decision.assistantEntryId;
-			persist(pi);
 			if (decision.complete) {
 				state.active = false;
 				persist(pi);
 				pi.sendMessage({ customType: "goal", content: `✅ Goal complete: ${state.goal}\n\n${decision.reason}`, display: true });
 			} else {
+				state.runTimestamps.push(Date.now());
+				persist(pi);
 				pi.sendUserMessage(`Continue working toward this goal until it is fully complete:\n\n${state.goal}\n\nGoal-check result: not complete yet. ${decision.reason}`, { deliverAs: "followUp" });
 			}
 		} catch (error) {

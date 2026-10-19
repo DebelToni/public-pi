@@ -1,179 +1,44 @@
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
+import { existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { textOfMessage } from "../modes/shared.js";
+import { resolveSessionReference, UPSTREAM_SESSION_REFS_ENV } from "../lib/upstream-session-refs.js";
+import { getPiInvocation, isForcedPiSession, piChildEnvironment, subagentModel } from "../lib/pi-subprocess.js";
+import {
+	runBoundedProcess,
+	SESSION_SOURCE_PATH_ENV,
+	SessionStoreClient,
+	type CatalogEntry,
+	type CatalogSession,
+	type EntryRef,
+} from "../lib/session-store-client.js";
 
-const DEFAULT_MODEL_ID = "gpt-5.6-sol";
+const DEFAULT_MODEL_ID = "gpt-6-luna";
 const CODEX_ACCOUNTS_EXTENSION = join(getAgentDir(), "extensions", "codex-accounts", "index.ts");
-const MAX_SCAN_SESSIONS = 400;
+const SEARCH_SESSION_EXTENSION = join(getAgentDir(), "extensions", "search-session", "index.ts");
+const ASK_SESSION_EXTENSION = join(getAgentDir(), "extensions", "ask-past-session", "index.ts");
 const MAX_PROMPT_QUERY_CHARS = 4000;
+const ORACLE_TIMEOUT_MS = 2 * 60 * 1000;
+const CONTEXT_TIMEOUT_MS = 3 * 60 * 1000;
+const PARTIAL_WARNING = "WARNING: Session catalog coverage is partial; failed or stale sources were excluded, so discovery is incomplete.";
+const ANSWER_BYTES = 40 * 1024;
 
-type SessionCandidate = {
-	file: string;
-	id: string;
-	cwd: string;
-	timestamp: string;
-	modifiedMs: number;
-	score: number;
-	matches: string[];
-	leafId?: string;
-};
+function boundedAnswer(answer: string) {
+	const bytes = Buffer.from(answer);
+	if (bytes.length <= ANSWER_BYTES) return answer;
+	let end = ANSWER_BYTES - 90;
+	while (end > 0 && (bytes[end] & 0b1100_0000) === 0b1000_0000) end--;
+	return `${bytes.subarray(0, end).toString("utf8")}\n\n[Answer truncated at 40 KiB; narrow the question.]`;
+}
+
+type SessionCandidate = CatalogSession & { file: string };
 
 type JsonEvent = {
 	type?: string;
 	message?: Message;
 };
-
-function expandPath(input: string) {
-	if (input === "~") return homedir();
-	if (input.startsWith("~/")) return join(homedir(), input.slice(2));
-	return input;
-}
-
-function normalizePath(input: string) {
-	return resolve(expandPath(input));
-}
-
-function sessionDirForCwd(cwd: string) {
-	const resolvedCwd = normalizePath(cwd);
-	const safePath = `--${resolvedCwd.replace(/^[\/\\]/, "").replace(/[\/\\:]/g, "-")}--`;
-	return join(getAgentDir(), "sessions", safePath);
-}
-
-function listJsonlFiles(dir: string) {
-	try {
-		if (!existsSync(dir)) return [];
-		return readdirSync(dir, { withFileTypes: true })
-			.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-			.map((entry) => join(dir, entry.name));
-	} catch {
-		return [];
-	}
-}
-
-function listAllSessionFiles() {
-	const root = join(getAgentDir(), "sessions");
-	try {
-		if (!existsSync(root)) return [];
-		return readdirSync(root, { withFileTypes: true })
-			.filter((entry) => entry.isDirectory())
-			.flatMap((entry) => listJsonlFiles(join(root, entry.name)));
-	} catch {
-		return [];
-	}
-}
-
-function readJsonLines(file: string, maxLines = 5000) {
-	try {
-		const lines = readFileSync(file, "utf8").split("\n").filter(Boolean).slice(0, maxLines);
-		const parsed: any[] = [];
-		for (const line of lines) {
-			try {
-				parsed.push(JSON.parse(line));
-			} catch {}
-		}
-		return parsed;
-	} catch {
-		return [];
-	}
-}
-
-function fileHeader(file: string) {
-	const [header] = readJsonLines(file, 1);
-	if (header?.type !== "session" || typeof header.cwd !== "string") return undefined;
-	return header as { id?: string; cwd: string; timestamp?: string; parentSession?: string };
-}
-
-function escapeRegExp(input: string) {
-	return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function queryTerms(query: string) {
-	return query.toLowerCase().split(/[^a-z0-9._-]+/i).filter((term) => term.length >= 3).slice(0, 12);
-}
-
-function messagePreview(message: Message) {
-	return truncateToWidth(textOfMessage(message).replace(/\s+/g, " ").trim(), 500);
-}
-
-function buildCandidate(file: string, query: string, sinceMs: number | undefined, cwdFilter?: string, sessionHint?: string): SessionCandidate | undefined {
-	let stat;
-	try {
-		stat = statSync(file);
-	} catch {
-		return undefined;
-	}
-	if (sinceMs && stat.mtimeMs < sinceMs) return undefined;
-	const entries = readJsonLines(file);
-	const header = entries.find((entry) => entry?.type === "session");
-	if (!header?.cwd) return undefined;
-	const cwd = String(header.cwd);
-	if (cwdFilter) {
-		const normalizedCwd = normalizePath(cwdFilter);
-		if (normalizePath(cwd) !== normalizedCwd && !normalizePath(cwd).startsWith(`${normalizedCwd}/`)) return undefined;
-	}
-
-	const q = query.trim();
-	const hint = sessionHint?.trim();
-	const terms = queryTerms(`${q} ${hint ?? ""}`);
-	const regex = q ? new RegExp(escapeRegExp(q), "i") : undefined;
-	let score = 0;
-	let bestLocalScore = 0;
-	let leafId: string | undefined;
-	const matches: string[] = [];
-
-	if (hint && `${file}\n${cwd}`.toLowerCase().includes(hint.toLowerCase())) score += 5;
-	for (const entry of entries) {
-		if (entry?.type !== "message") continue;
-		const message = entry.message as Message | undefined;
-		if (!message) continue;
-		const text = textOfMessage(message).replace(/\s+/g, " ");
-		const lower = text.toLowerCase();
-		let local = 0;
-		if (regex?.test(text)) local += 20;
-		for (const term of terms) if (lower.includes(term)) local += 2;
-		if (local > 0) {
-			score += local;
-			if (local >= bestLocalScore && typeof entry.id === "string") {
-				bestLocalScore = local;
-				leafId = entry.id;
-			}
-			if (matches.length < 4) matches.push(`${message.role}: ${messagePreview(message)}`);
-		}
-	}
-	if (score <= 0 && (q || hint)) return undefined;
-	return {
-		file,
-		id: String(header.id ?? ""),
-		cwd,
-		timestamp: String(header.timestamp ?? new Date(stat.birthtimeMs).toISOString()),
-		modifiedMs: stat.mtimeMs,
-		score: score + Math.max(0, 5 - matches.length),
-		matches,
-		leafId,
-	};
-}
-
-function findCandidates(params: { query: string; cwd?: string; sinceHours?: number; sessionHint?: string; limit?: number }) {
-	const sinceMs = params.sinceHours && params.sinceHours > 0 ? Date.now() - params.sinceHours * 60 * 60 * 1000 : undefined;
-	const files = (params.cwd ? listJsonlFiles(sessionDirForCwd(params.cwd)) : listAllSessionFiles())
-		.map((file) => ({ file, mtime: statSync(file).mtimeMs }))
-		.sort((a, b) => b.mtime - a.mtime)
-		.slice(0, MAX_SCAN_SESSIONS)
-		.map(({ file }) => file);
-	return files
-		.map((file) => buildCandidate(file, params.query, sinceMs, params.cwd, params.sessionHint))
-		.filter(Boolean)
-		.sort((a, b) => b!.score - a!.score || b!.modifiedMs - a!.modifiedMs)
-		.slice(0, Math.max(1, Math.min(20, params.limit ?? 5))) as SessionCandidate[];
-}
 
 function assistantText(message: AssistantMessage) {
 	return message.content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n").trim();
@@ -185,174 +50,298 @@ function codexModel(currentProvider: string | undefined, requested: string | und
 	return `${provider}/${DEFAULT_MODEL_ID}`;
 }
 
-function createDisposableBranch(candidate: SessionCandidate) {
-	const entries = readJsonLines(candidate.file);
-	const sourceHeader = entries.find((entry) => entry?.type === "session");
-	if (!sourceHeader?.cwd) throw new Error(`Invalid source session: ${candidate.file}`);
-	const nonHeader = entries.filter((entry) => entry?.type !== "session" && typeof entry?.id === "string");
-	const byId = new Map(nonHeader.map((entry) => [entry.id, entry]));
-	let leaf = candidate.leafId ? byId.get(candidate.leafId) : nonHeader[nonHeader.length - 1];
-	if (!leaf) throw new Error(`No entries in source session: ${candidate.file}`);
-	const path: any[] = [];
-	while (leaf) {
-		path.unshift(leaf);
-		leaf = leaf.parentId ? byId.get(leaf.parentId) : undefined;
-	}
-	if (path.length === 0) throw new Error(`Could not build branch path for: ${candidate.file}`);
-	const sessionDir = sessionDirForCwd(candidate.cwd);
-	mkdirSync(sessionDir, { recursive: true });
-	const timestamp = new Date().toISOString();
-	const id = randomUUID();
-	const branchFile = join(sessionDir, `${timestamp.replace(/[:.]/g, "-")}_${id}.jsonl`);
-	const header = {
-		type: "session",
-		version: 3,
-		id,
-		timestamp,
-		cwd: candidate.cwd,
-		parentSession: candidate.file,
-	};
-	const content = [header, ...path].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
-	writeFileSync(branchFile, content, "utf8");
-	return branchFile;
+function formatRef(ref: EntryRef | undefined, fallbackId?: string) {
+	return JSON.stringify(ref ?? { id: fallbackId ?? null });
 }
 
-function oraclePrompt(query: string) {
+function candidateEvidence(candidate: SessionCandidate) {
+	const matches = candidate.matches?.length ? candidate.matches : [candidate];
+	return matches.map((match) => `entryRef=${formatRef(match.matchedEntryRef, match.matchedEntryId)} role=${match.matchedRole ?? "unknown"}\n${match.excerpt ?? ""}`).join("\n");
+}
+
+function shortSearchQuery(query: string) {
+	const terms = [...query.matchAll(/[\p{L}\p{N}_-]+/gu)].map(([text], index) => ({ text, index }));
+	if (terms.length < 3) return undefined;
+	const ranked = terms.filter(({ text }) => text.length >= 3).map((term) => ({ ...term,
+		score: /[a-z][A-Z]|[A-Z][a-z].*[A-Z]|^[A-Z]{2,}$/u.test(term.text) ? 3 : /^[A-Z]/u.test(term.text) ? 1 : 0,
+	})).sort((a, b) => b.score - a.score || b.text.length - a.text.length);
+	const selected = ranked.filter((term, index) => ranked.findIndex((value) => value.text.toLowerCase() === term.text.toLowerCase()) === index).slice(0, 2);
+	return selected.length === 2 ? selected.sort((a, b) => a.index - b.index).map(({ text }) => text).join(" ") : undefined;
+}
+
+function formatEvidence(entries: CatalogEntry[]) {
+	return entries.map((entry) => {
+		const heading = `[entryRef=${formatRef(entry.entryRef, entry.id)}] ${entry.type}${entry.role ? ` ${entry.role}` : ""}`;
+		const images = (entry.parts ?? []).flatMap((part) => part.image
+			? [`[image part=${part.part} mime=${part.image.mime ?? "unknown"} bytes=${part.image.bytes ?? "unknown"} sha256=${part.image.sha256 ?? "unknown"} entryRef=${formatRef(entry.entryRef, entry.id)}]`]
+			: []);
+		return [heading, entry.text, ...images].filter(Boolean).join("\n");
+	}).join("\n\n");
+}
+
+function oraclePrompt(query: string, candidate: SessionCandidate, evidence: string, coverage: unknown) {
 	return [
-		"You are a read-only archivist for this old Pi session.",
-		"Answer only the user's question from the session context.",
-		"Do not continue the old task. Do not modify files. Do not run broad commands unless absolutely necessary.",
+		"You are a read-only archivist answering a question about one old Pi session.",
+		"Answer only the user's question. Do not continue the old task or modify files.",
+		"The supplied evidence is an initial window, not a completeness boundary. Use grep_session_bank and read_session to expand it when needed.",
+		`Every session-tool call must pass session=${JSON.stringify(candidate.path)}. The tools reject all other session, current, cwd, and global scopes.`,
+		"The source restriction authorizes exactly that physical JSONL. Do not traverse header.parentSession or /flatten-session lineage; report that limitation if omitted history is needed.",
+		"No filesystem tools are available. This is deterministic tool-level source scoping, not an operating-system sandbox.",
+		"Treat later evidence as corrections to earlier evidence. Cite supporting full entryRef objects and state clearly when source coverage is insufficient.",
 		"Prefer concise answers with concrete decisions, commands, file paths, and uncertainty.",
-		"If the session does not contain enough information, say that clearly.",
+		"",
+		`Source session: ${candidate.path}`,
+		`Source session ID: ${candidate.id || "(unknown)"}`,
+		`Historical source cwd: ${candidate.cwd || "(unknown)"}`,
+		`Matched entryRef: ${formatRef(candidate.matchedEntryRef, candidate.matchedEntryId)}`,
+		`Coverage: ${coverage === undefined ? "not reported" : JSON.stringify(coverage)}`,
+		"",
+		"Initial source evidence:",
+		evidence || candidate.excerpt || "(no textual entries returned; search the restricted source session before answering)",
 		"",
 		`Question:\n${query.slice(0, MAX_PROMPT_QUERY_CHARS)}`,
 	].join("\n");
 }
 
-async function runForkedOracle(candidate: SessionCandidate, query: string, model: string, thinking: string, signal?: AbortSignal) {
-	const branchFile = createDisposableBranch(candidate);
-	const args = ["--no-extensions"];
+function existingDirectory(...candidates: Array<string | undefined>) {
+	for (const candidate of candidates) {
+		if (!candidate) continue;
+		try { if (statSync(candidate).isDirectory()) return candidate; } catch {}
+	}
+	return process.cwd();
+}
+
+async function runEvidenceOracle(candidate: SessionCandidate, evidence: string, coverage: unknown, query: string, model: string, thinking: string, cwd: string, signal?: AbortSignal, provider?: string) {
+	const invocation = isForcedPiSession() ? getPiInvocation([]) : { command: "pi", args: [] };
+	const args = ["--no-extensions", ...(provider ? ["--provider", provider] : [])];
 	if (existsSync(CODEX_ACCOUNTS_EXTENSION)) args.push("-e", CODEX_ACCOUNTS_EXTENSION);
-	args.push("--mode", "json", "--session", branchFile, "--model", model, "--thinking", thinking, "--tools", "read,grep,find,ls", "-p", oraclePrompt(query));
-	let stderr = "";
-	let rawStdout = "";
+	args.push("-e", SEARCH_SESSION_EXTENSION);
+	args.push(
+		"--mode", "json",
+		"--no-session",
+		"--model", model,
+		"--thinking", thinking,
+		"--tools", "grep_session_bank,read_session",
+		"-p", oraclePrompt(query, candidate, evidence, coverage),
+	);
+	const env = piChildEnvironment();
+	env.PI_TELEMETRY = "0";
+	env.PI_SKIP_VERSION_CHECK = "1";
+	delete env[UPSTREAM_SESSION_REFS_ENV];
+	env[SESSION_SOURCE_PATH_ENV] = resolve(candidate.path);
+	const result = await runBoundedProcess(invocation.command, [...invocation.args, ...args], {
+		cwd,
+		env,
+		signal,
+		timeoutMs: ORACLE_TIMEOUT_MS,
+		maxStdoutBytes: 2 * 1024 * 1024,
+		maxStderrBytes: 128 * 1024,
+	});
+	return { ...result, ...parseAnswer(result.stdout, model) };
+}
+
+function parseAnswer(stdout: string, model: string) {
 	let final = "";
 	let usedModel = model;
-	let usage: any = undefined;
-
-	const exitCode = await new Promise<number>((resolve) => {
-		const proc = spawn("pi", args, { cwd: candidate.cwd, stdio: ["ignore", "pipe", "pipe"] });
-		let buffer = "";
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			rawStdout += `${line}\n`;
-			let event: JsonEvent;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				return;
-			}
-			if (event.type === "message_end" && event.message?.role === "assistant") {
-				const message = event.message as AssistantMessage;
-				const text = assistantText(message);
-				if (text) final = text;
-				usedModel = message.provider && message.model ? `${message.provider}/${message.model}` : usedModel;
-				usage = message.usage;
-			}
-		};
-		proc.stdout.on("data", (data) => {
-			buffer += data.toString();
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-			for (const line of lines) processLine(line);
-		});
-		proc.stderr.on("data", (data) => {
-			stderr += data.toString();
-		});
-		proc.on("close", (code) => {
-			if (buffer.trim()) processLine(buffer);
-			resolve(code ?? 0);
-		});
-		proc.on("error", () => resolve(1));
-		const kill = () => {
-			proc.kill("SIGTERM");
-			setTimeout(() => {
-				if (!proc.killed) proc.kill("SIGKILL");
-			}, 5000).unref?.();
-		};
-		if (signal?.aborted) kill();
-		else signal?.addEventListener("abort", kill, { once: true });
-	});
-
-	const deletedForks: string[] = [];
-	try {
-		rmSync(branchFile, { force: true });
-		deletedForks.push(branchFile);
-	} catch {}
-
-	return { exitCode, final, stderr, rawStdout, deletedForks, usedModel, usage, branchFile };
+	let usage: any;
+	for (const line of stdout.split("\n")) {
+		if (!line.trim()) continue;
+		let event: JsonEvent;
+		try { event = JSON.parse(line); } catch { continue; }
+		if (event.type !== "message_end" || event.message?.role !== "assistant") continue;
+		const message = event.message as AssistantMessage;
+		const text = assistantText(message);
+		if (text) final = text;
+		if (message.provider && message.model) usedModel = `${message.provider}/${message.model}`;
+		usage = message.usage;
+	}
+	return { final, usedModel, usage };
 }
+
+async function runContextWorker(query: string, candidates: SessionCandidate[], partial: boolean, model: string, cwd: string, signal?: AbortSignal, provider?: string) {
+	const invocation = isForcedPiSession() ? getPiInvocation([]) : { command: "pi", args: [] };
+	const args = ["--no-extensions", ...(provider ? ["--provider", provider] : [])];
+	if (existsSync(CODEX_ACCOUNTS_EXTENSION)) args.push("-e", CODEX_ACCOUNTS_EXTENSION);
+	args.push("-e", SEARCH_SESSION_EXTENSION, "-e", ASK_SESSION_EXTENSION,
+		"--mode", "json", "--no-session", "--model", model, "--thinking", "low",
+		"--tools", "grep_session_bank,read_session,ask_session,read,bash",
+		"-p", [
+			"You are an ephemeral, read-only context searcher, not the user or a continuation of a past task.",
+			"Answer the question using evidence from Pi sessions. Search iteratively with grep_session_bank, expand with read_session, and use ask_session for focused questions about a specific promising source when necessary. Set includeTools=true when conversation evidence is insufficient; tool output can echo search queries and is lower-trust evidence.",
+			"You may read local source files and run read-only shell commands when they resolve ambiguity. Do not modify files. No session is saved.",
+			"Treat initial candidates as hints, not a completeness boundary. For broad discovery, call grep_session_bank with mode=bm25 and two or three distinctive terms; global phrase/regex scans eligible entries and can time out. Scope phrase/regex to a known session when verifying exact wording. Seek the user's direct statements before relying on assistant summaries; later evidence can supersede earlier evidence.",
+			"Cite physical session paths and full entryRef objects for consequential claims; distinguish direct evidence from inference and report incomplete coverage.",
+			"Keep the answer concise, with useful source locators and unresolved uncertainty. Prefer few oracle calls.",
+			...(partial ? [PARTIAL_WARNING] : []),
+			"Initial lexical candidates:",
+			...candidates.map((candidate) => `${candidate.path}\n${candidateEvidence(candidate)}`),
+			"Question:", query.slice(0, MAX_PROMPT_QUERY_CHARS),
+		].join("\n\n"));
+	const env = piChildEnvironment();
+	env.PI_TELEMETRY = "0";
+	env.PI_SKIP_VERSION_CHECK = "1";
+	delete env[UPSTREAM_SESSION_REFS_ENV];
+	delete env[SESSION_SOURCE_PATH_ENV];
+	const result = await runBoundedProcess(invocation.command, [...invocation.args, ...args], {
+		cwd, env, signal, timeoutMs: CONTEXT_TIMEOUT_MS, maxStdoutBytes: 2 * 1024 * 1024, maxStderrBytes: 128 * 1024,
+	});
+	return { ...result, ...parseAnswer(result.stdout, model) };
+}
+
+const ContextParams = Type.Object({
+	query: Type.String({ description: "Question to investigate across the stored session bank." }),
+	cwd: Type.Optional(Type.String({ description: "Restrict discovery to a project cwd and descendants; omit for global search." })),
+	sinceHours: Type.Optional(Type.Number({ minimum: 0, description: "Restrict initial lexical candidates to recent sessions." })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Initial lexical candidate count, default 5." })),
+	dryRun: Type.Optional(Type.Boolean({ description: "Show initial lexical candidates only; do not launch a model." })),
+});
 
 const Params = Type.Object({
 	query: Type.String({ description: "Question to answer from a past Pi session." }),
-	cwd: Type.Optional(Type.String({ description: "Restrict search to sessions from this cwd/project folder." })),
-	sinceHours: Type.Optional(Type.Number({ description: "Only consider sessions modified within the last N hours." })),
-	sessionHint: Type.Optional(Type.String({ description: "Optional extra text to help find the right session." })),
-	session: Type.Optional(Type.String({ description: "Exact session file path to ask. Skips search." })),
-	model: Type.Optional(Type.String({ description: "Model for the disposable fork. Defaults to current-codex-provider/gpt-5.6-sol." })),
-	thinking: Type.Optional(Type.String({ description: "Thinking level for the disposable fork. Default: low." })),
-	limit: Type.Optional(Type.Number({ description: "Number of candidate sessions to inspect during search. Default: 5." })),
-	dryRun: Type.Optional(Type.Boolean({ description: "Only show candidate sessions; do not fork or ask." })),
+	session: Type.String({ description: "Required exact session ID (from a fan-in handoff) or physical JSONL path. Never discovers other sessions." }),
+	model: Type.Optional(Type.String({ description: "Model for the evidence oracle. Defaults to current-codex-provider/gpt-6-luna." })),
+	thinking: Type.Optional(Type.String({ description: "Thinking level for the evidence oracle. Default: low." })),
+	dryRun: Type.Optional(Type.Boolean({ description: "Inspect initial matches without launching the evidence oracle." })),
 });
 
 export default function (pi: ExtensionAPI) {
-	pi.registerTool({
-		name: "ask_past_session",
-		label: "Ask Past Session",
-		description: "Ask a disposable fork of a past Pi session a focused question, then delete the fork so current context stays small.",
+	const client = new SessionStoreClient();
+	const definition: any = {
+		name: "ask_session",
+		label: "Ask Session",
+		description: "Ask a focused question about one REQUIRED physical session path (or a mapped fan-in session ID). A fresh ephemeral Luna child can grep/read only that source and returns a cited answer; no cross-session discovery. Use search_context when the source is unknown.",
 		parameters: Params,
-		async execute(_id, params, signal, onUpdate, ctx) {
-			const model = codexModel(ctx.model?.provider, params.model);
-			const thinking = params.thinking?.trim() || "low";
-			let candidates: SessionCandidate[];
-			if (params.session?.trim()) {
-				const file = normalizePath(params.session);
-				const candidate = buildCandidate(file, params.query, undefined, undefined, params.sessionHint);
-				const header = fileHeader(file);
-				if (!header) throw new Error(`Invalid session file: ${file}`);
-				candidates = [candidate ?? { file, id: String(header.id ?? ""), cwd: header.cwd, timestamp: String(header.timestamp ?? ""), modifiedMs: statSync(file).mtimeMs, score: 0, matches: [] }];
-			} else {
-				candidates = findCandidates(params);
-			}
-			if (candidates.length === 0) return { content: [{ type: "text", text: "No matching past sessions found." }], details: { candidates: [] } };
-			const candidate = candidates[0];
-			const candidateText = candidates.map((c, i) => `${i + 1}. ${c.id || c.file}\n   cwd: ${c.cwd}\n   file: ${c.file}\n   score: ${c.score}\n   matches: ${c.matches.join(" | ") || "(none)"}`).join("\n\n");
+		async execute(_id: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
+			if (!params.query?.trim()) throw new Error("Question cannot be empty.");
+			if (!params.session?.trim()) throw new Error("ask_session requires one exact source session.");
+			const target = resolveSessionReference(params.session);
+			if (process.env[SESSION_SOURCE_PATH_ENV] && resolve(process.env[SESSION_SOURCE_PATH_ENV]) !== resolve(target.filePath)) throw new Error("This evidence child cannot ask about another source session.");
+			onUpdate?.({ content: [{ type: "text", text: `Checking source-session catalog freshness for ${target.filePath}...` }], details: {} });
+			const freshness = await client.reconcile({ path: target.filePath }, signal);
+			const response = await client.search(params.query, {
+				path: target.filePath, limit: 1, matches: 1, mode: "bm25", role: "conversation",
+			}, signal);
+			const discoveryCoverage = response.coverage;
+			const match = response.results[0];
+			const candidates: SessionCandidate[] = [{
+				...(match ?? {}), path: target.filePath, file: target.filePath,
+				id: target.sessionId || match?.id || "", cwd: match?.cwd || ctx.cwd || process.cwd(),
+			}];
+			const candidateText = candidates.map((candidate, index) => [
+				`${index + 1}. ${candidate.name || candidate.firstMessage || candidate.id || candidate.path}`,
+				`   cwd: ${candidate.cwd || "(unknown)"}`,
+				`   file: ${candidate.path}`,
+				candidate.matchedEntryId ? `   matchedEntryRef: ${formatRef(candidate.matchedEntryRef, candidate.matchedEntryId)}${candidate.matchedRole ? ` (${candidate.matchedRole})` : ""}` : undefined,
+				`   excerpt: ${candidate.excerpt || "(none)"}`,
+			].filter(Boolean).join("\n")).join("\n\n");
 			if (params.dryRun) {
-				return { content: [{ type: "text", text: `Candidate sessions:\n\n${candidateText}` }], details: { candidates } };
+				const heading = "Initial matches within the exact session:";
+				return { content: [{ type: "text", text: `${heading}\n\n${candidateText}` }], details: { candidates, freshness, coverage: discoveryCoverage } };
 			}
-			onUpdate?.({ content: [{ type: "text", text: `Asking disposable fork of ${candidate.id || candidate.file} with ${model}...` }], details: { candidate, model, thinking } });
-			const result = await runForkedOracle(candidate, params.query, model, thinking, signal);
-			if (result.exitCode !== 0 && !result.final) {
-				throw new Error(`Past-session oracle failed with exit ${result.exitCode}: ${result.stderr.trim() || "no stderr"}`);
+
+			const candidate = candidates[0];
+			const source = await client.read({
+				path: candidate.path,
+				entry: candidate.matchedEntryId,
+				byteStart: candidate.matchedEntryRef?.byteStart,
+				before: candidate.matchedEntryId ? 12 : 48,
+				after: candidate.matchedEntryId ? 36 : 0,
+				limit: 64,
+				maxChars: 40_000,
+			}, signal);
+			const evidence = formatEvidence(source.entries);
+			const sourceCoverage = { coverage: source.coverage, leafRef: source.leafRef, leafSelection: source.leafSelection };
+			let model = codexModel(ctx.model?.provider, params.model);
+			const thinking = params.thinking?.trim() || "low";
+			const selection = subagentModel(model, ctx);
+			model = selection.model!;
+			const oracleCwd = existingDirectory(candidate.cwd, ctx.cwd, process.cwd());
+			onUpdate?.({
+				content: [{ type: "text", text: `Asking source-scoped evidence oracle for ${candidate.id || candidate.path} with ${model}...` }],
+				details: { candidate, model, thinking, cwd: oracleCwd, entryCount: source.entries.length, coverage: sourceCoverage },
+			});
+			const result = await runEvidenceOracle(candidate, evidence, sourceCoverage, params.query, model, thinking, oracleCwd, signal, selection.provider);
+			if (result.code !== 0) {
+				throw new Error(`Past-session evidence oracle failed with exit ${result.code}: ${result.stderr.trim() || "no stderr"}`);
 			}
-			const text = [
-				result.final || "No answer was produced.",
-				"",
-				`Source: ${candidate.file}`,
-				`Model: ${result.usedModel}`,
-				`Fork cleanup: deleted ${result.deletedForks.length} file${result.deletedForks.length === 1 ? "" : "s"}`,
-			].join("\n");
 			return {
-				content: [{ type: "text", text }],
+				usage: result.usage,
+				content: [{
+					type: "text",
+					text: [
+						boundedAnswer(result.final || "No answer was produced."),
+						"",
+						`Source: ${candidate.path}`,
+						`Initial evidence entries: ${source.entries.length}`,
+						`Model: ${result.usedModel}`,
+					].join("\n"),
+				}],
 				details: {
 					candidate,
 					candidates,
 					model: result.usedModel,
 					usage: result.usage,
-					exitCode: result.exitCode,
-					deletedForks: result.deletedForks,
+					exitCode: result.code,
 					stderr: result.stderr,
+					coverage: source.coverage,
+					leafRef: source.leafRef,
+					leafSelection: source.leafSelection,
+					freshness,
+					discoveryCoverage,
+					oracleCwd,
+					oracleMode: "source-restricted-expandable-evidence",
 				},
+			};
+		},
+	};
+	pi.registerTool(definition);
+
+	pi.registerTool({
+		name: "search_context",
+		label: "Search Context",
+		description: "Investigate an open-ended question across stored Pi sessions. Launches a fresh ephemeral Luna/low agent for short BM25 discovery queries, scoped evidence reads, and optional exact-session oracles. Slower than direct grep; returns a sourced synthesis. Use grep_current_session for this conversation.",
+		parameters: ContextParams,
+		async execute(_id, params, signal, onUpdate, ctx) {
+			if (!params.query?.trim()) throw new Error("Question cannot be empty.");
+			if (process.env[SESSION_SOURCE_PATH_ENV]) throw new Error("A source-restricted child cannot search context across sessions.");
+			const cwd = params.cwd ? resolve(params.cwd) : undefined;
+			onUpdate?.({ content: [{ type: "text", text: `Checking ${cwd ? "project" : "global"} session catalog freshness...` }], details: {} });
+			const freshness = await client.reconcile(cwd ? { cwd, tree: true } : { all: true }, signal, { allowIncomplete: true });
+			let partial = freshness?.scopeComplete === false;
+			const searchOptions = {
+				cwd, tree: Boolean(cwd), limit: Math.max(1, Math.min(20, params.limit ?? 5)),
+				matches: 1, mode: "bm25" as const, role: "conversation",
+				sinceHours: params.sinceHours, allowPartial: true,
+			};
+			let response = await client.search(params.query, searchOptions, signal);
+			const queriesTried = [params.query];
+			const shorter = !response.results.length && shortSearchQuery(params.query);
+			if (shorter) {
+				queriesTried.push(shorter);
+				response = await client.search(shorter, { ...searchOptions, matches: 3 }, signal);
+			}
+			partial ||= response.coverage?.scopeComplete === false;
+			const candidates = response.results.map((row) => ({ ...row, file: row.path }));
+			const candidateText = candidates.map((row, index) => [
+				`${index + 1}. ${row.name || row.firstMessage || row.id || row.path}`,
+				`session: ${row.id || "(unknown)"}`, `path: ${row.path}`,
+				candidateEvidence(row),
+			].join("\n")).join("\n\n");
+			if (params.dryRun) return {
+				content: [{ type: "text", text: [partial ? PARTIAL_WARNING : "Initial lexical candidates:", candidateText || "No initial candidates."].join("\n\n") }],
+				details: { candidates, queriesTried, partial, freshness, coverage: response.coverage },
+			};
+			let model = codexModel(ctx.model?.provider, undefined);
+			const selection = subagentModel(model, ctx);
+			model = selection.model!;
+			const workerCwd = existingDirectory(cwd, ctx.cwd, process.cwd());
+			onUpdate?.({ content: [{ type: "text", text: `Searching session bank with ephemeral ${model}...` }], details: { candidates: candidates.length, partial } });
+			const result = await runContextWorker(params.query, candidates, partial, model, workerCwd, signal, selection.provider);
+			if (result.code !== 0) throw new Error(`Context search worker failed with exit ${result.code}: ${result.stderr.trim() || "no stderr"}`);
+			return {
+				content: [{ type: "text", text: [partial ? PARTIAL_WARNING : "", boundedAnswer(result.final || "No answer was produced.")].filter(Boolean).join("\n\n") }],
+				details: { candidates, queriesTried, partial, freshness, coverage: response.coverage, model: result.usedModel, usage: result.usage, exitCode: result.code },
+				usage: result.usage,
 			};
 		},
 	});

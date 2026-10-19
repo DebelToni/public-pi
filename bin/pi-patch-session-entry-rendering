@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import os
+
+TARGET = Path(os.environ.get(
+    "PI_INTERACTIVE_MODE_PATH",
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js",
+))
+text = TARGET.read_text("utf8")
+marker = "appendSessionEntriesToTranscript: (entries, options = {}) =>"
+
+if marker in text:
+    print("session entry rendering patch already present")
+    raise SystemExit(0)
+
+old = '''            getToolsExpanded: () => this.toolOutputExpanded,
+            setToolsExpanded: (expanded) => this.setToolsExpanded(expanded),
+'''
+new = '''            appendSessionEntriesToTranscript: (entries, options = {}) => {
+                const previousExpanded = this.toolOutputExpanded;
+                const previousHideThinking = this.hideThinkingBlock;
+                const previousPendingTools = new Map(this.pendingTools);
+                try {
+                    if (options.expanded !== undefined) {
+                        this.toolOutputExpanded = options.expanded;
+                    }
+                    if (options.showThinking === true) {
+                        this.hideThinkingBlock = false;
+                    }
+                    this.renderSessionEntries(entries);
+                }
+                finally {
+                    this.toolOutputExpanded = previousExpanded;
+                    this.hideThinkingBlock = previousHideThinking;
+                    this.pendingTools.clear();
+                    for (const [toolCallId, component] of previousPendingTools) {
+                        this.pendingTools.set(toolCallId, component);
+                    }
+                }
+            },
+            getToolsExpanded: () => this.toolOutputExpanded,
+            setToolsExpanded: (expanded) => this.setToolsExpanded(expanded),
+'''
+
+count = text.count(old)
+if count != 1:
+    raise RuntimeError(f"session entry rendering: expected one match in {TARGET}, found {count}")
+
+TARGET.write_text(text.replace(old, new), "utf8")
+print(f"patched session entry rendering in {TARGET}")

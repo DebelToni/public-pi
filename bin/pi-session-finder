@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+import json
+import os
+import selectors
+import signal
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+AGENT_DIR = Path(os.environ.get("PI_AGENT_DIR", Path.home() / ".pi" / "agent"))
+CATALOG_CLI = Path(os.environ.get("PI_SESSION_CATALOG_CLI", AGENT_DIR / "bin" / "pi-session-catalog"))
+PI_LAUNCHER = Path(os.environ.get("PI_SESSION_FINDER_LAUNCHER", AGENT_DIR / "bin" / "pi"))
+TMP_SEARCH_DIR = Path("/tmp/pi-session-search")
+CATALOG_RECONCILE_TIMEOUT_SECONDS = 30
+CATALOG_QUERY_TIMEOUT_SECONDS = 15
+CATALOG_STDOUT_LIMIT = 16 * 1024 * 1024
+CATALOG_STDERR_LIMIT = 64 * 1024
+
+
+class CatalogError(RuntimeError):
+    pass
+
+
+def clean(value: object) -> str:
+    return " ".join(str(value or "").replace("\t", " ").split())
+
+
+def parse_time(value):
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 10_000_000_000 else value
+    if isinstance(value, str):
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0
+    return 0
+
+
+def _catalog_command_args(args):
+    args = list(args)
+    separator = args.index("--") if "--" in args else len(args)
+    return [str(CATALOG_CLI), *args[:separator], "--compact", *args[separator:]]
+
+
+def _bounded_process(argv, timeout, stdout_limit=CATALOG_STDOUT_LIMIT, stderr_limit=CATALOG_STDERR_LIMIT):
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as error:
+        raise CatalogError(f"could not start session catalog: {error}") from error
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ, ("stdout", stdout_limit))
+    selector.register(proc.stderr, selectors.EVENT_READ, ("stderr", stderr_limit))
+    chunks = {"stdout": [], "stderr": []}
+    sizes = {"stdout": 0, "stderr": 0}
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CatalogError(f"session catalog timed out after {timeout}s")
+            events = selector.select(min(remaining, 0.25))
+            if not events and proc.poll() is not None:
+                events = [(key, selectors.EVENT_READ) for key in list(selector.get_map().values())]
+            for key, _ in events:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 65536)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                name, limit = key.data
+                sizes[name] += len(chunk)
+                if sizes[name] > limit:
+                    raise CatalogError(f"session catalog exceeded the {name} limit ({limit} bytes)")
+                chunks[name].append(chunk)
+        code = proc.wait(timeout=1)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=2)
+        raise
+    finally:
+        selector.close()
+        proc.stdout.close()
+        proc.stderr.close()
+    return code, b"".join(chunks["stdout"]).decode("utf8", "replace"), b"".join(chunks["stderr"]).decode("utf8", "replace")
+
+
+def run_catalog(args, timeout=CATALOG_QUERY_TIMEOUT_SECONDS, allow_partial=False):
+    code, stdout, stderr = _bounded_process(_catalog_command_args(args), timeout)
+    try:
+        response = json.loads(stdout)
+    except ValueError as error:
+        if code == 0:
+            raise CatalogError(f"session catalog returned invalid JSON: {error}") from error
+        response = None
+    # The CLI returns structured partial receipts with nonzero exit codes.
+    partial_receipt = allow_partial and not stderr.strip() and isinstance(response, dict) and (
+        args[0] == "reconcile" and code == 2 and response.get("scopeComplete") is False and isinstance(response.get("failures"), list)
+        or args[0] in {"list", "search"} and code == 1 and isinstance(response.get("results"), list)
+        and isinstance(response.get("coverage"), dict) and response["coverage"].get("scopeComplete") is False
+    )
+    if code != 0 and not partial_receipt:
+        detail = clean(stderr or stdout)[:1000] or "no diagnostic output"
+        raise CatalogError(f"session catalog exited {code}: {detail}")
+    return response
+
+
+def catalog_doc(row):
+    score = row.get("score")
+    return {
+        "path": str(row.get("path") or ""),
+        "id": str(row.get("id") or ""),
+        "cwd": str(row.get("cwd") or Path.home()),
+        "created": parse_time(row.get("created")),
+        "modified": parse_time(row.get("modified")),
+        "name": clean(row.get("name")),
+        "first": clean(row.get("firstMessage")),
+        "title": clean(row.get("name") or row.get("firstMessage") or "(no messages)"),
+        "messages": int(row.get("messageCount") or 0),
+        "score": float(score) if isinstance(score, (int, float)) else 0.0,
+        "excerpt": clean(row.get("excerpt")),
+        "matchedEntryId": str(row.get("matchedEntryId") or ""),
+        "matchedRole": str(row.get("matchedRole") or ""),
+        "matchedEntryRef": row.get("matchedEntryRef") if isinstance(row.get("matchedEntryRef"), dict) else None,
+        "matches": row.get("matches") if isinstance(row.get("matches"), list) else [],
+    }
+
+
+def reconcile_catalog(args, allow_partial=False):
+    freshness = run_catalog(["reconcile", *args], timeout=CATALOG_RECONCILE_TIMEOUT_SECONDS, allow_partial=allow_partial)
+    if isinstance(freshness, dict) and freshness.get("scopeComplete") is False and not allow_partial:
+        failures = clean(json.dumps(freshness.get("failures") or []))[:1000]
+        raise CatalogError(f"catalog freshness is incomplete{': ' + failures if failures else ''}")
+    return freshness
+
+
+def catalog_sessions(query: str):
+    freshness = reconcile_catalog(["--all"], allow_partial=True)
+    partial = isinstance(freshness, dict) and freshness.get("scopeComplete") is False
+    if query.strip():
+        response = run_catalog(["search", "--mode", "bm25", "--matches", "3", "--limit", "1000", "--allow-partial", "--", query.strip()], allow_partial=True)
+    else:
+        response = run_catalog(["list", "--limit", "1000", "--allow-partial"], allow_partial=True)
+    if not isinstance(response, dict) or not isinstance(response.get("results"), list):
+        raise CatalogError("session catalog response is missing results")
+    coverage = response.get("coverage") if isinstance(response.get("coverage"), dict) else {}
+    partial = partial or coverage.get("scopeComplete") is False
+    sessions = [catalog_doc(row) for row in response["results"] if isinstance(row, dict) and row.get("path")]
+    return sessions, freshness, coverage, partial
+
+
+def ranked_sessions(query: str):
+    sessions, _freshness, _coverage, _partial = catalog_sessions(query)
+    return sessions
+
+def age(timestamp):
+    delta = max(0, time.time() - timestamp)
+    if delta < 3600:
+        return f"{int(delta // 60)}m"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h"
+    return f"{int(delta // 86400)}d"
+
+
+def preview_record(path: str, cache_path=None):
+    if cache_path:
+        try:
+            record = json.loads(Path(cache_path).read_text("utf8")).get(path)
+            if record:
+                return record
+        except Exception:
+            pass
+    reconcile_catalog(["--path", path])
+    response = run_catalog(["list", "--limit", "1000"])
+    for row in response.get("results", []):
+        if row.get("path") == path:
+            return catalog_doc(row)
+    return None
+
+
+def preview(path: str, cache_path=None):
+    info = preview_record(path, cache_path)
+    if not info:
+        print("Session metadata unavailable from the fresh catalog")
+        return
+    print(f"CWD:  {info.get('cwd', '')}")
+    if info.get("name"):
+        print(f"Name: {info['name']}")
+    print(f"Last: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(info.get('modified') or 0))}")
+    print(f"Messages: {info.get('messages', 0)}")
+    print("\n--- First message ---")
+    print((info.get("first") or info.get("title") or "(none)")[:1600])
+    if info.get("excerpt"):
+        print("\n--- Search match ---")
+        print(info["excerpt"][:2000])
+
+
+def read_catalog_entries(path: str, entry_id="", entry_ref=None):
+    reconcile_catalog(["--path", path])
+    args = [
+        "read", "--path", path,
+        "--before", "12" if entry_id else "48",
+        "--after", "36" if entry_id else "0",
+        "--limit", "64",
+        "--max-chars", "40000",
+    ]
+    if entry_id:
+        args.extend(["--entry", entry_id])
+    if isinstance(entry_ref, dict) and isinstance(entry_ref.get("byteStart"), int):
+        args.extend(["--byte-start", str(entry_ref["byteStart"])])
+    response = run_catalog(args)
+    if not isinstance(response, dict) or not isinstance(response.get("entries"), list):
+        raise CatalogError("session catalog read response is missing entries")
+    return response
+
+
+def pi_launch_command(*args: str):
+    return shlex.join([str(PI_LAUNCHER), *args])
+
+
+def tmux_new_window(title: str, cwd: str, command: str):
+    shell = os.environ.get("SHELL") or "/bin/sh"
+    quoted_shell = shlex.quote(shell)
+    retained_command = f"{command}; exec {quoted_shell} -i"
+    startup_command = f"exec {quoted_shell} -ic {shlex.quote(retained_command)}"
+    subprocess.run(["tmux", "new-window", "-n", title, "-c", cwd, startup_command], check=True)
+
+
+def write_selected_workspace(query: str, selected):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    workspace = TMP_SEARCH_DIR / stamp
+    workspace.mkdir(parents=True, exist_ok=True)
+    selected_json = []
+    excerpts = ["# Pi selected-session evidence\n", f"Query: {query or '(empty)'}\n"]
+    for index, item in enumerate(selected, 1):
+        path = str(item["path"])
+        response = read_catalog_entries(path, item.get("matchedEntryId", ""), item.get("matchedEntryRef"))
+        selected_json.append({
+            "display": item["display"],
+            "path": path,
+            "id": item.get("id", ""),
+            "cwd": item.get("cwd", ""),
+            "title": item.get("title", ""),
+            "modified": item.get("modified", 0),
+            "messages": item.get("messages", 0),
+            "matchedEntryId": item.get("matchedEntryId", ""),
+            "matchedEntryRef": item.get("matchedEntryRef"),
+            "coverage": response.get("coverage"),
+            "leafId": response.get("leafId"),
+            "leafSelection": response.get("leafSelection"),
+        })
+        excerpts.extend([
+            f"\n## [{index}] {item['display']}\n",
+            f"CWD: {item.get('cwd', '')}\n",
+            f"Session: {path}\n",
+            f"Leaf: {response.get('leafId') or '(none)'} ({response.get('leafSelection') or 'unspecified'})\n",
+            f"Coverage: {json.dumps(response.get('coverage'))}\n",
+            "\n### Catalog source entries\n",
+        ])
+        entries = response["entries"]
+        if not entries:
+            excerpts.append(f"{item.get('excerpt') or item.get('first') or '(no catalog text extracted)'}\n")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            heading = f"{entry.get('type', 'entry')} {entry.get('role', '')}".strip()
+            entry_ref = entry.get("entryRef") if isinstance(entry.get("entryRef"), dict) else {"id": entry.get("id")}
+            excerpts.append(f"\n**[entryRef={json.dumps(entry_ref, separators=(',', ':'))}] {heading}**: {clean(entry.get('text'))}\n")
+    (workspace / "selected-sessions.json").write_text(json.dumps(selected_json, indent=2), "utf8")
+    (workspace / "selected-excerpts.md").write_text("".join(excerpts), "utf8")
+    (workspace / "search-brief.md").write_text(
+        f"Query: {query or '(empty)'}\n\nRead selected-excerpts.md first. selected-sessions.json contains exact catalog sources and coverage.\n",
+        "utf8",
+    )
+    return workspace
+
+
+def ask_agent(query: str, selected=None):
+    selected = selected or []
+    if selected:
+        workspace = write_selected_workspace(query, selected)
+        scope = "Read selected-excerpts.md first. It contains bounded normalized source evidence around each marked match, including later corrections when catalog coverage permits. Use read_session with selected-sessions.json only for focused follow-up."
+    else:
+        TMP_SEARCH_DIR.mkdir(parents=True, exist_ok=True)
+        workspace = TMP_SEARCH_DIR
+        scope = "Use search_session with global=true, then read_session or ask_session for focused evidence."
+    prompt = f"""You are a focused Pi session-search agent.
+
+Find the prior Pi session/content Anton is looking for:
+
+{query}
+
+{scope}
+
+Return the likely session/project and a compact answer with next steps."""
+    tmux_new_window("pi-search", str(workspace), pi_launch_command(prompt))
+
+
+def confirm_agent_search(query: str, input_fn=input, ask_fn=ask_agent, partial=False):
+    prompt = "No matches among fresh indexed sources; coverage is incomplete. Ask Pi search agent? [y/N] " if partial else "No catalog matches. Ask Pi search agent? [y/N] "
+    try:
+        answer = input_fn(prompt).strip().lower()
+    except EOFError:
+        return False
+    if answer not in {"y", "yes"}:
+        return False
+    ask_fn(query)
+    return True
+
+
+def open_session(session_path: str, cwd: str):
+    base = Path(cwd).name or "pi"
+    tmux_new_window(f"pi:{base}"[:32], cwd, pi_launch_command("--session", session_path))
+
+
+def make_preview_cache(sessions):
+    TMP_SEARCH_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = tempfile.TemporaryDirectory(prefix="finder-", dir=TMP_SEARCH_DIR)
+    os.chmod(temporary.name, 0o700)
+    cache_path = Path(temporary.name) / "preview.json"
+    cache_path.write_text(json.dumps({session["path"]: session for session in sessions}), "utf8")
+    os.chmod(cache_path, 0o600)
+    return temporary, cache_path
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--preview":
+        try:
+            preview(sys.argv[3], sys.argv[2]) if len(sys.argv) >= 4 else preview(sys.argv[2])
+        except CatalogError as error:
+            print(f"Catalog freshness/read failure: {error}", file=sys.stderr)
+            return 2
+        return 0
+    if not os.environ.get("TMUX"):
+        print("pi-session-finder must run inside tmux", file=sys.stderr)
+        return 1
+    if not shutil_which("fzf"):
+        print("fzf not found", file=sys.stderr)
+        return 1
+    try:
+        query = input("Search Pi sessions: ").strip()
+    except EOFError:
+        return 0
+    try:
+        print("Checking session catalog freshness...", file=sys.stderr, flush=True)
+        sessions, freshness, coverage, partial = catalog_sessions(query)
+    except CatalogError as error:
+        print(f"Catalog freshness check failed; refusing stale results: {error}", file=sys.stderr)
+        return 2
+    if partial:
+        print("WARNING: Catalog coverage is partial; failed or stale sources were excluded.", file=sys.stderr)
+    rows = []
+    for session in sessions:
+        cwd_base = Path(session["cwd"]).name or session["cwd"]
+        display = f"{age(session['modified']):>4}  {cwd_base:<22.22}  {session['title'][:120]}"
+        rows.append("\t".join([display, session["path"], session["cwd"]]))
+    if not rows:
+        if partial:
+            print("No matches among fresh indexed session sources; coverage is incomplete.", file=sys.stderr)
+        confirm_agent_search(query, partial=partial)
+        return 0
+    script = Path(__file__).resolve()
+    preview_temporary, preview_path = make_preview_cache(sessions)
+    try:
+        proc = subprocess.run([
+            "fzf", "--delimiter", "\t", "--with-nth", "1", "--nth", "1",
+            "--expect", "ctrl-a", "--multi", "--prompt", "Pi sessions> ",
+            "--header", "Tab: mark sessions | Enter: open selected | Ctrl-A: prep+ask agent about marked/current | Esc: cancel",
+            "--preview", f"{shlex.quote(str(script))} --preview {shlex.quote(str(preview_path))} {{2}}",
+            "--preview-window", "down,45%,wrap",
+        ], input="\n".join(rows), text=True, capture_output=True)
+    finally:
+        preview_temporary.cleanup()
+    if proc.returncode in (1, 130):
+        return 0
+    if proc.returncode != 0:
+        print(f"Session picker failed (exit {proc.returncode}): {clean(proc.stderr)}", file=sys.stderr)
+        return 2
+    output = proc.stdout.splitlines()
+    if not output:
+        return 0
+    key, selected_rows = output[0].strip(), output[1:]
+    sessions_by_path = {session["path"]: session for session in sessions}
+    selected = []
+    for row in selected_rows:
+        parts = row.split("\t")
+        if len(parts) >= 3:
+            selected.append({**sessions_by_path.get(parts[1], {}), "display": parts[0], "path": parts[1], "cwd": parts[2]})
+    if key == "ctrl-a":
+        try:
+            ask_agent(query, selected)
+        except CatalogError as error:
+            print(f"Catalog source read failed; no agent launched: {error}", file=sys.stderr)
+            return 2
+        return 0
+    if selected:
+        open_session(selected[0]["path"], selected[0]["cwd"])
+    return 0
+
+
+def shutil_which(name: str):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        path = Path(directory) / name
+        if path.exists() and os.access(path, os.X_OK):
+            return str(path)
+    return None
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"Session finder failed: {error}", file=sys.stderr)
+        sys.exit(2)

@@ -2,7 +2,6 @@
   "name": "public-pi",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
   "description": "Reusable Pi extensions mirrored from Anton Hristov's configuration",
   "keywords": [],
   "engines": {
@@ -11,8 +10,7 @@
   "dependencies": {
     "lossless-json": "4.3.1",
     "marked": "18.0.5",
-    "proper-lockfile": "4.1.2",
-    "sshpk": "1.18.0"
+    "proper-lockfile": "4.1.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -40,6 +38,8 @@
   },
   "pi": {
     "extensions": [],
-    "prompts": []
+    "skills": [],
+    "prompts": [],
+    "themes": []
   }
 }

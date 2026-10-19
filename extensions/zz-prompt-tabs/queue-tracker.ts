@@ -43,6 +43,12 @@ export class QueuedDraftTracker {
 		return [actual];
 	}
 
+	reconcile(entries: QueuedDraft[]) {
+		// Native text can already contain expanded skills/templates. Keep each
+		// remaining prompt separate without retaining a cancelled invocation.
+		this.entries = entries.map((entry) => ({ ...entry }));
+	}
+
 	reset() {
 		this.entries = [];
 	}

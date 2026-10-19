@@ -7,7 +7,7 @@ import {
 	supportsOneShotMediumFast,
 	type OneShotMediumFastRequest,
 } from "../lib/one-shot-medium-fast.js";
-import { DurablePromptTabsStore } from "./durable-state.ts";
+import { DurablePromptTabsStore, type ClosedPromptTab } from "./durable-state.ts";
 import { QueuedDraftTracker } from "./queue-tracker.ts";
 import { TabbedEditor, type DraftTabsSnapshot } from "./tabbed-editor.ts";
 
@@ -54,15 +54,20 @@ function discardEmptySession(
 	ctx: { sessionManager: { getSessionFile: () => string | undefined; getEntries: () => Array<{ type: string }> } },
 	store: DurablePromptTabsStore | undefined,
 	snapshot: DraftTabsSnapshot | undefined,
+	retainRecoveryState: boolean,
 ) {
-	if (hasMessages(ctx) || (snapshot && hasMeaningfulDraftState(snapshot))) return;
+	if (hasMessages(ctx) || retainRecoveryState || (snapshot && hasMeaningfulDraftState(snapshot))) return;
 	const sessionFile = ctx.sessionManager.getSessionFile();
 	if (sessionFile && existsSync(sessionFile)) unlinkSync(sessionFile);
 	store?.discard();
 }
 
-function reloadSnapshotFor(value: ReloadSnapshotValue | undefined, sessionFile: string | undefined) {
-	if (!value || !("snapshot" in value)) return value;
+function reloadSnapshotFor(
+	value: ReloadSnapshotValue | undefined,
+	sessionFile: string | undefined,
+): DraftTabsSnapshot | undefined {
+	if (!value) return undefined;
+	if (!("snapshot" in value)) return value;
 	if (!sessionFile || resolve(value.sessionFile) !== resolve(sessionFile)) return undefined;
 	return value.snapshot;
 }
@@ -70,8 +75,10 @@ function reloadSnapshotFor(value: ReloadSnapshotValue | undefined, sessionFile: 
 export default function (pi: ExtensionAPI) {
 	const queuedDrafts = new QueuedDraftTracker();
 	let editor: TabbedEditor | undefined;
-	let persistCurrent: ((snapshot: DraftTabsSnapshot) => void) | undefined;
+	let persistCurrent: ((snapshot: DraftTabsSnapshot, closedTabs?: ClosedPromptTab[], requireMaterialized?: boolean) => boolean) | undefined;
 	let store: DurablePromptTabsStore | undefined;
+	let persistedClosedTabs: ClosedPromptTab[] = [];
+	let retainSessionForDurableState = false;
 	let sessionFile: string | undefined;
 	let sessionId: string | undefined;
 
@@ -85,6 +92,7 @@ export default function (pi: ExtensionAPI) {
 		const reportedIssues = new Set<string>();
 		let sessionMaterialized = sessionFile ? existsSync(sessionFile) : false;
 		let durableSnapshot: DraftTabsSnapshot | undefined;
+		let durableClosedTabs: ClosedPromptTab[] = [];
 
 		const reportOnce = (message: string, level: "warning" | "error") => {
 			if (reportedIssues.has(message)) return;
@@ -95,28 +103,42 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const loaded = store.load();
 				durableSnapshot = loaded.snapshot;
+				durableClosedTabs = loaded.closedTabs;
+				persistedClosedTabs = structuredClone(loaded.closedTabs);
+				retainSessionForDurableState = loaded.diagnostics.length > 0;
 				for (const diagnostic of loaded.diagnostics) reportOnce(diagnostic, "warning");
 			} catch (error) {
+				retainSessionForDurableState = true;
 				reportOnce(`Could not load prompt-tab state: ${error instanceof Error ? error.message : String(error)}`, "error");
 			}
 		}
 
-		const persist = (snapshot: DraftTabsSnapshot) => {
-			if (!store) return;
-			if (sessionFile && !sessionMaterialized && hasMeaningfulDraftState(snapshot)) {
+		const persist = (
+			snapshot: DraftTabsSnapshot,
+			closedTabs: ClosedPromptTab[] = [],
+			requireMaterialized = false,
+		) => {
+			if (!store) return false;
+			if (sessionFile && !sessionMaterialized && (hasMeaningfulDraftState(snapshot) || closedTabs.length > 0)) {
 				const manager = ctx.sessionManager as typeof ctx.sessionManager & { flushPendingEntries?: () => void };
 				try {
 					if (!manager.flushPendingEntries) throw new Error("this Pi runtime lacks flushPendingEntries()");
 					manager.flushPendingEntries();
 					sessionMaterialized = existsSync(sessionFile);
+					if (!sessionMaterialized) throw new Error("Pi did not create the session file");
 				} catch (error) {
 					reportOnce(`Could not materialize the session for prompt-tab recovery: ${error instanceof Error ? error.message : String(error)}`, "error");
+					if (requireMaterialized) return false;
 				}
 			}
+			if (requireMaterialized && sessionFile && !sessionMaterialized) return false;
 			try {
-				store.save(snapshot);
+				store.save(snapshot, closedTabs);
+				persistedClosedTabs = structuredClone(closedTabs);
+				return true;
 			} catch (error) {
 				reportOnce(`Could not persist prompt tabs: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return false;
 			}
 		};
 		persistCurrent = persist;
@@ -137,22 +159,31 @@ export default function (pi: ExtensionAPI) {
 				recall: (actualQueuedText) => queuedDrafts.recall(actualQueuedText),
 				onFooterChange: (text) => pi.events.emit(FOOTER_CHANNEL, text),
 				onStateChange: persist,
+				commitCriticalState: (nextSnapshot, closedTabs) => persist(nextSnapshot, closedTabs, true),
+				initialClosedTabs: durableClosedTabs,
 				onSubmitError: (error) => {
 					pi.events.emit(ONE_SHOT_MEDIUM_FAST_CHANNEL, { action: "cancel" } satisfies OneShotMediumFastRequest);
 					ctx.ui.notify(`Prompt submission failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 				},
 			});
 			if (snapshot) editor.restoreSnapshot(snapshot);
-			persist(editor.getSnapshot());
+			persist(editor.getSnapshot(), editor.getClosedTabs());
 			return editor;
 		});
 	});
 
 	pi.on("session_shutdown", (event, ctx) => {
 		const finalSnapshot = editor?.getSnapshot();
-		if (finalSnapshot) persistCurrent?.(finalSnapshot);
+		const finalClosedTabs = editor?.getClosedTabs() ?? persistedClosedTabs;
+		if (finalSnapshot) persistCurrent?.(finalSnapshot, finalClosedTabs);
 		try {
-			discardEmptySession(ctx, store, finalSnapshot);
+			discardEmptySession(
+				ctx,
+				store,
+				finalSnapshot,
+				// Reload keeps closed-tab undo; leaving an empty session does not.
+				(event.reason === "reload" && finalClosedTabs.length > 0) || retainSessionForDurableState,
+			);
 		} catch (error) {
 			ctx.ui.notify(`Could not discard empty session: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}
@@ -165,6 +196,8 @@ export default function (pi: ExtensionAPI) {
 		editor = undefined;
 		persistCurrent = undefined;
 		store = undefined;
+		persistedClosedTabs = [];
+		retainSessionForDurableState = false;
 		sessionFile = undefined;
 		sessionId = undefined;
 		queuedDrafts.reset();
@@ -173,7 +206,7 @@ export default function (pi: ExtensionAPI) {
 	// zz-prompt-tabs loads after the other user extensions, so this records the
 	// final chained input text only when Pi actually accepts it for queueing.
 	pi.on("input", (event) => {
-		if (event.source === "interactive" && event.streamingBehavior) {
+		if (event.streamingBehavior) {
 			queuedDrafts.track(event.text, event.streamingBehavior);
 		}
 	});
@@ -183,14 +216,67 @@ export default function (pi: ExtensionAPI) {
 		if (text !== undefined) queuedDrafts.consume(text);
 	});
 
+	// Individual cancellation has no message_start. Reconcile recall metadata
+	// from the remaining native messages so a later Alt+Up cannot resurrect it.
+	pi.events?.on?.("pi-web:queue-recalled", (queue: Array<{ text: string; mode: "steer" | "followUp" }>) => {
+		queuedDrafts.reconcile(queue.map(({ text, mode }) => ({ text, behavior: mode })));
+	});
+
+	// The phone bridge edits the same durable drafts as the terminal.
+	pi.events?.on?.("pi-web:tabs", (request: any) => {
+		if (!editor) return;
+		const current = editor.getSnapshot();
+		if (request.action && request.action !== "read" && request.expected !== JSON.stringify(current)) {
+			request.error = "Draft changed in the terminal. Refresh before editing.";
+			return;
+		}
+		switch (request.action) {
+			case "new": editor.newDraft(); break;
+			case "recall": {
+				if (typeof request.text !== "string" || request.text.length > 200000) throw new Error("Invalid draft text");
+				const next = { texts: [...current.texts, request.text], activeIndex: current.texts.length };
+				// Persist before touching the live editor or cancelling the native item.
+				if (!persistCurrent?.(next, editor.getClosedTabs(), true)) {
+					request.error = "Could not persist the recovered prompt. The follow-up remains queued.";
+					return;
+				}
+				editor.newDraft(request.text);
+				request.recalled = true;
+				break;
+			}
+			case "close": editor.closeCurrentDraft(); break;
+			case "restore": editor.restoreClosedDraft(); break;
+			case "select":
+				if (!Number.isInteger(request.index) || request.index < 0 || request.index >= current.texts.length) throw new Error("Invalid draft index");
+				editor.selectDraft(request.index);
+				break;
+			case "text":
+				if (typeof request.text !== "string" || request.text.length > 200000) throw new Error("Invalid draft text");
+				editor.setText(request.text);
+				break;
+		}
+		request.result = { ...editor.getSnapshot(), closedCount: editor.getClosedTabs().length, recallSupported: true };
+	});
+
 	pi.registerShortcut("alt+t", {
 		description: "Create a new prompt tab",
 		handler: () => editor?.newDraft(),
 	});
 
 	pi.registerShortcut("alt+w", {
-		description: "Close the current prompt tab",
-		handler: () => editor?.closeCurrentDraft(),
+		description: "Close and archive the current prompt tab",
+		handler: () => { editor?.closeCurrentDraft(); },
+	});
+
+	pi.registerShortcut("alt+shift+t", {
+		description: "Restore the most recently closed prompt tab",
+		handler: (ctx) => {
+			if (!editor?.getClosedTabs().length) {
+				ctx.ui.notify("No closed prompt tabs to restore.", "info");
+				return;
+			}
+			editor.restoreClosedDraft();
+		},
 	});
 
 	pi.registerShortcut("ctrl+f", {

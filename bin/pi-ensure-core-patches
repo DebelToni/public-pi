@@ -1,0 +1,224 @@
+#!/bin/sh
+set -eu
+
+root=${PI_CODING_AGENT_ROOT:-/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent}
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+agent_session=$root/dist/core/agent-session.js
+extension_loader=$root/dist/core/extensions/loader.js
+extension_types=$root/dist/core/extensions/types.d.ts
+compaction=$root/dist/core/compaction/compaction.js
+overflow=$root/node_modules/@earendil-works/pi-ai/dist/utils/overflow.js
+codex_responses=$root/node_modules/@earendil-works/pi-ai/dist/api/openai-codex-responses.js
+ai_types=$root/node_modules/@earendil-works/pi-ai/dist/types.d.ts
+simple_options=$root/node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+interactive=$root/dist/modes/interactive/interactive-mode.js
+selector=$root/dist/modes/interactive/components/session-selector.js
+selector_types=$root/dist/modes/interactive/components/session-selector.d.ts
+picker=$root/dist/cli/session-picker.js
+picker_types=$root/dist/cli/session-picker.d.ts
+main=$root/dist/main.js
+bash_tool=$root/dist/core/tools/bash.js
+durable_queue=$root/dist/core/durable-message-queue.js
+agent_core=$root/node_modules/@earendil-works/pi-agent-core/dist/agent.js
+agent_core_types=$root/node_modules/@earendil-works/pi-agent-core/dist/agent.d.ts
+session_manager=$root/dist/core/session-manager.js
+session_manager_types=$root/dist/core/session-manager.d.ts
+session_catalog_client=$root/dist/core/session-catalog-client.js
+session_catalog_client_source=$bin_dir/../lib/session-catalog/runtime-client.mjs
+proper_lockfile=$root/node_modules/proper-lockfile/index.js
+
+has_marker() {
+	grep -Fq "$2" "$1" 2>/dev/null
+}
+
+has_marker_count() {
+	count=$(grep -Foc "$2" "$1" 2>/dev/null || true)
+	[ "${count:-0}" -eq "$3" ]
+}
+
+codex_affinity_present() {
+	if has_marker "$codex_responses" 'const cacheSessionId = clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId);' \
+		&& has_marker "$codex_responses" 'const websocketRequestId = cacheSessionId || uuidv7();' \
+		&& has_marker "$codex_responses" 'buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, cacheSessionId);' \
+		&& has_marker "$codex_responses" 'buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);' \
+		&& has_marker "$codex_responses" 'prompt_cache_key: clampOpenAIPromptCacheKey(options?.cacheSessionId ?? options?.sessionId),'; then
+		return 0
+	fi
+	has_marker "$codex_responses" 'const transportSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;' \
+		&& has_marker "$codex_responses" 'const cacheSessionId = options?.cacheRetention === "none" ? undefined : (options?.cacheSessionId ?? options?.sessionId);' \
+		&& has_marker "$codex_responses" 'const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);' \
+		&& has_marker "$codex_responses" 'buildRequestBody(model, context, options, codexSessionId, grammarToolInputProperties);' \
+		&& has_marker "$codex_responses" 'buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);' \
+		&& has_marker "$codex_responses" 'buildWebSocketHeaders(model.headers, options?.headers, accountId, apiKey, websocketRequestId);' \
+		&& has_marker "$codex_responses" 'isWebSocketSseFallbackActive(transportSessionId)' \
+		&& has_marker_count "$codex_responses" 'recordWebSocketSseFallback(transportSessionId);' 2 \
+		&& has_marker "$codex_responses" 'websocketConnectTimeoutMs, transportSessionId,' \
+		&& has_marker "$codex_responses" 'async function processWebSocketStream(url, body, headers, output, stream, model, onStart, idleTimeoutMs, websocketConnectTimeoutMs, transportSessionId,' \
+		&& has_marker "$codex_responses" 'recordWebSocketFailure(transportSessionId, error);' \
+		&& has_marker "$codex_responses" 'acquireWebSocket(url, headers, transportSessionId,' \
+		&& has_marker "$codex_responses" 'getOrCreateWebSocketDebugStats(transportSessionId)' \
+		&& has_marker "$codex_responses" 'prompt_cache_key: cacheSessionId,'
+}
+
+session_resume_present() {
+	if cmp -s "$session_catalog_client_source" "$session_catalog_client" \
+		&& has_marker "$main" 'import { createSessionCatalogBoundary } from "./core/session-catalog-client.js";' \
+		&& has_marker "$interactive" 'import { createSessionCatalogBoundary } from "../../core/session-catalog-client.js";' \
+		&& has_marker "$main" 'createSessionCatalogBoundary({ cwd, useCatalog: sessionDir === undefined' \
+		&& has_marker "$main" 'settingsManager, cwd, catalog.search);' \
+		&& has_marker "$interactive" 'const selector = new SessionSelectorComponent(catalog.loadCurrent, catalog.loadSubtree, catalog.loadAll' \
+		&& has_marker "$interactive" 'searchSessions: catalog.search' \
+		&& has_marker "$picker" 'keybindings, searchSessions' \
+		&& has_marker "$selector" 'scheduleCatalogSearch(query, immediate = false)' \
+		&& has_marker "$selector" 'this.searchAbort?.abort();' \
+		&& has_marker "$selector" 'session.searchExcerpt ? session.searchExcerpt' \
+		&& has_marker "$selector_types" 'type CatalogSessionSearch = (query: string, options: {' \
+		&& has_marker "$selector_types" 'searchSessions?: CatalogSessionSearch;' \
+		&& has_marker "$picker_types" 'searchSessions?: (query: string, options: {' \
+		&& has_marker "$session_catalog_client" 'export const SESSION_CATALOG_CLIENT_VERSION = 1;' \
+		&& has_marker "$session_catalog_client" 'export function createSessionCatalogBoundary' \
+		&& has_marker "$session_catalog_client" 'return legacySearch(rawQuery, options);'; then
+		return 0
+	fi
+	return 1
+}
+
+patches_present() {
+	has_marker "$overflow" 'const hasAnswerOutput = message.content.some' \
+		&& has_marker "$agent_session" '    _isExactCodexOverload(message) {' \
+		&& has_marker "$agent_session" 'message.errorMessage?.trim() === "Codex error: Our servers are currently overloaded. Please try again later.";' \
+		&& has_marker "$agent_session" 'const delayMs = this._isExactCodexOverload(message)' \
+		&& has_marker "$agent_session" '? 180_000' \
+		&& has_marker "$agent_session" 'Wait for the selected retry delay (abortable).' \
+		&& has_marker "$agent_session" 'const completedToolTurn = turn.toolResults.length > 0' \
+		&& has_marker "$agent_session" 'thresholdWillRetry = false' \
+		&& has_marker "$agent_session" 'reason !== "overflow" || !willRetry || this._autoCompactionAbortController.signal.aborted' \
+		&& has_marker "$agent_session" 'if (!extensionResult?.cancel && extensionResult?.compaction)' \
+		&& has_marker "$agent_session" '_thresholdCompactionFailedInRun = false;' \
+		&& has_marker "$agent_session" 'this._thresholdCompactionFailedInRun = false; // Allow one threshold failure in each low-level agent run.' \
+		&& has_marker "$agent_session" 'this._thresholdCompactionFailedInRun = false; // Let the next prompt'\''s preflight try compaction again.' \
+		&& has_marker "$agent_session" 'if (this._thresholdCompactionFailedInRun)' \
+		&& has_marker "$agent_session" 'let thresholdCompactionSucceeded = false;' \
+		&& has_marker "$agent_session" 'thresholdCompactionSucceeded = true;' \
+		&& has_marker "$agent_session" 'if (reason === "threshold" && !thresholdCompactionSucceeded)' \
+		&& has_marker "$agent_session" 'this._thresholdCompactionFailedInRun = true;' \
+		&& has_marker "$agent_session" 'lastMsg.stopReason === "error" || lastMsg.stopReason === "length"' \
+		&& { ! has_marker "$agent_session" 'isRecoverableLength(assistantMessage' || has_marker "$agent_session" 'const recoverableLength = !hasAnswerOutput && sameModel'; } \
+		&& has_marker "$compaction" 'cutPoints.find((candidate) => candidate >= i)' \
+		&& has_marker "$interactive" 'this.activeStatusIndicator?.kind === "working" || this.activeStatusIndicator?.kind === "compaction"' \
+		&& has_marker "$interactive" 'appendSessionEntriesToTranscript: (entries, options = {}) =>' \
+		&& has_marker "$selector" 'expandedChains = new Set();' \
+		&& has_marker "$selector" 'subtreeSessionsLoader;' \
+		&& has_marker "$selector" 'session.__piOwnModified instanceof Date' \
+		&& has_marker "$selector" 'const canonicalPathCache = new Map();' \
+		&& has_marker "$selector" 'const selectedPath = this.getSelectedSessionPath();' \
+		&& has_marker "$selector" 'node.chainPaths?.includes(target)' \
+		&& has_marker "$selector" 'currentLoadSeq = 0;' \
+		&& has_marker "$selector" 'progressRenderedCounts = { current: 0, subtree: 0, all: 0 };' \
+		&& has_marker "$selector" 'progressSessionCaches = { current: null, subtree: null, all: null };' \
+		&& has_marker "$selector" 'const existing = this.progressSessionCaches[scope] ?? [];' \
+		&& has_marker "$selector" 'renderedCount === 0 || sessions.length - renderedCount >= 25' \
+		&& has_marker "$selector" 'session.partial ? "…"' \
+		&& has_marker "$selector" 'mergeProgressSessions(scope, available) {' \
+		&& has_marker "$selector" 'available?.length ? this.mergeProgressSessions(scope, available)' \
+		&& has_marker "$picker" 'const subtreeSessionsLoader = async (onProgress)' \
+		&& has_marker "$picker" 'available?.filter(inCurrentTree)' \
+		&& has_marker "$picker" 'if (!session.cwd)' \
+		&& has_marker "$picker" 'sessionCwd.startsWith(currentTreePrefix)' \
+		&& session_resume_present \
+		&& has_marker "$bash_tool" 'const appendTiming = (text) => appendStatus(text, `Took ${elapsed()}`);' \
+		&& has_marker "$bash_tool" 'Command aborted by the user after ${elapsed()}' \
+		&& has_marker "$bash_tool" '.replace(/Command aborted by the user after \d+\.\ds$/, "Command aborted")' \
+		&& has_marker "$agent_session" 'Return the run promise so recovery can keep one-shot sessions alive.' \
+		&& has_marker "$extension_loader" 'Preserve the runtime promise for one-shot continuation recovery.' \
+		&& has_marker "$extension_types" 'Send a custom message and resolve after any triggered agent run settles.' \
+		&& has_marker "$extension_types" 'Returns when a triggered agent run settles; callers may continue to ignore the promise.' \
+		&& has_marker "$agent_session" 'this._durableMessageQueue = new DurableMessageQueue(this.sessionManager);' \
+		&& has_marker "$agent_session" 'preserveDurableMessageId(event.message, durableMessageId);' \
+		&& has_marker "$agent_session" 'event.message.details, durableMessageId);' \
+		&& has_marker "$agent_session" 'this._durableMessageQueue.reconcileCommitted(durableMessageId);' \
+		&& has_marker "$agent_session" 'this._durableMessageQueue.dispose();' \
+		&& has_marker "$agent_session" 'this._queueDurableMessage(options?.deliverAs === "followUp" ? "followUp" : "steer", appMessage);' \
+		&& has_marker "$agent_session" 'const queuedMessages = this.agent.getQueuedMessages();' \
+		&& has_marker "$agent_session" 'await this._durableRecoveryPromise;' \
+		&& has_marker "$agent_session" 'queuedPrompt ? this.agent.promptFromQueue(messages)' \
+		&& has_marker "$agent_session" 'const initialMode = steeringRecords.length > 0' \
+		&& has_marker "$agent_session" 'async _recoverDurableMessages() {' \
+		&& has_marker "$agent_session" 'await this._recoverDurableMessages();' \
+		&& has_marker "$agent_core" 'async promptFromQueue(input) {' \
+		&& has_marker "$agent_core" 'getQueuedMessages() {' \
+		&& has_marker "$agent_core" 'return [...this.clearSteeringQueue(), ...this.clearFollowUpQueue()];' \
+		&& has_marker "$agent_core_types" 'promptFromQueue(message: AgentMessage | AgentMessage[]): Promise<void>;' \
+		&& has_marker "$agent_core_types" 'getQueuedMessages(): AgentMessage[];' \
+		&& has_marker "$agent_core_types" 'clearAllQueues(): AgentMessage[];' \
+		&& has_marker "$session_manager" 'flushPendingEntries() {' \
+		&& has_marker "$session_manager" 'linkSync(temporaryPath, this.sessionFile);' \
+		&& has_marker "$session_manager" '...(durableQueueId ? { durableQueueId } : {}),' \
+		&& has_marker "$session_manager" 'async function buildSessionPreview(filePath)' \
+		&& has_marker "$session_manager" 'const MAX_CONCURRENT_SESSION_PREVIEW_LOADS = 16;' \
+		&& has_marker "$session_manager" 'buildSessionPreviews(allFiles, allFiles.length)' \
+		&& has_marker "$session_manager" 'listSessionsFromDir(dir, reportProgress, 0, undefined, filterCwd)' \
+		&& has_marker "$session_manager" 'progress(0, totalFiles, previews);' \
+		&& has_marker "$session_manager" 'const MAX_CONCURRENT_SESSION_METADATA_LOADS = 32;' \
+		&& has_marker "$session_manager" 'async function sortSessionFilesNewestFirst(files)' \
+		&& has_marker "$session_manager" 'const initialLoadLimit = Math.min(files.length, MAX_CONCURRENT_SESSION_INFO_LOADS);' \
+		&& has_marker "$session_manager" 'const loadLimit = hasPublished || nextPublishedIndex >= initialLoadLimit' \
+		&& has_marker "$session_manager" 'onProgress?.(progressOffset + loaded, total, available);' \
+		&& has_marker "$session_manager_types" 'flushPendingEntries(): void;' \
+		&& has_marker "$session_manager_types" 'durableQueueId?: string;' \
+		&& has_marker "$session_manager_types" 'available?: SessionInfo[]' \
+		&& has_marker "$session_manager_types" 'partial?: boolean;' \
+		&& has_marker "$session_manager_types" 'details?: T, durableQueueId?: string): string;' \
+		&& has_marker "$durable_queue" 'export const DURABLE_QUEUE_PATCH_VERSION = 11;' \
+		&& has_marker "$durable_queue" 'this.sessionManager.flushPendingEntries();' \
+		&& has_marker "$durable_queue" 'await committedIdsFromDisk(currentSessionFile)' \
+		&& has_marker "$durable_queue" 'ownerProcessIdentity: currentProcessIdentity' \
+		&& has_marker "$durable_queue" 'type: "cancel",' \
+		&& has_marker "$durable_queue" 'skippedScopeCount' \
+		&& has_marker "$durable_queue" 'export class DurableMessageQueue' \
+		&& [ -f "$proper_lockfile" ] \
+		&& codex_affinity_present \
+		&& has_marker "$ai_types" 'cacheSessionId?: string;' \
+		&& has_marker "$simple_options" 'cacheSessionId: options?.cacheSessionId'
+}
+
+if patches_present; then
+	exit 0
+fi
+
+log=$(mktemp "${TMPDIR:-/tmp}/pi-core-patches.XXXXXX")
+trap 'rm -f "$log"' EXIT HUP INT TERM
+
+export PI_CODING_AGENT_ROOT=$root
+export PI_AI_ROOT=$root/node_modules/@earendil-works/pi-ai
+export PI_INTERACTIVE_MODE_PATH=$interactive
+export PI_SESSION_SELECTOR_PATH=$selector
+export PI_SESSION_PICKER_PATH=$picker
+export PI_MAIN_PATH=$main
+export PI_BASH_TOOL_PATH=$bash_tool
+export PI_CODEX_RESPONSES_PATH=$codex_responses
+export PI_AI_TYPES_PATH=$ai_types
+export PI_SIMPLE_OPTIONS_PATH=$simple_options
+
+if ! {
+	"$bin_dir/pi-patch-active-compaction" \
+		&& "$bin_dir/pi-patch-codex-overload-retry" \
+		&& "$bin_dir/pi-patch-durable-message-queue" \
+		&& "$bin_dir/pi-patch-awaited-extension-send-message" \
+		&& "$bin_dir/pi-patch-compaction-loader-progress" \
+		&& "$bin_dir/pi-patch-session-entry-rendering" \
+		&& "$bin_dir/pi-patch-session-selector-chains" \
+		&& "$bin_dir/pi-patch-session-selector-subtree-scope" \
+		&& "$bin_dir/pi-patch-progressive-session-listing" \
+		&& "$bin_dir/pi-patch-session-catalog-resume" \
+		&& "$bin_dir/pi-patch-bash-tool-elapsed-results" \
+		&& "$bin_dir/pi-patch-codex-cache-affinity"
+} >"$log" 2>&1 || ! patches_present; then
+	cat "$log" >&2
+	printf '%s\n' 'Pi core patches are incompatible with this installed release; refusing to start unpatched.' >&2
+	printf '%s\n' 'Bypass only for recovery: PI_SKIP_LOCAL_PATCH_CHECK=1 /opt/homebrew/bin/pi -ne' >&2
+	exit 1
+fi
+
+printf '%s\n' 'Restored local Pi core patches after update.' >&2
